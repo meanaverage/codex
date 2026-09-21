@@ -1125,6 +1125,224 @@ async fn manual_compact_uses_compact_service_tier() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_runs_on_compact_model_provider() {
+    skip_if_no_network!();
+
+    let session_server = start_mock_server().await;
+    let compaction_server = start_mock_server().await;
+    let session_log = mount_sse_sequence(
+        &session_server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m0", FIRST_REPLY),
+                ev_completed_with_tokens("r0", /*total_tokens*/ 80),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", "after compaction"),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 120),
+            ]),
+        ],
+    )
+    .await;
+    let compaction_log = mount_sse_sequence(
+        &compaction_server,
+        vec![sse(vec![
+            ev_assistant_message("m1", SUMMARY_TEXT),
+            ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+        ])],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&session_server);
+    let compact_provider = non_openai_model_provider(&compaction_server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.compact_model_provider = Some(compact_provider);
+    });
+    let codex = builder
+        .build(&session_server)
+        .await
+        .expect("create conversation")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_ONE".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_TWO".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit second user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(
+        session_log.requests().len(),
+        2,
+        "session provider only sees sampling requests"
+    );
+    let compaction_requests = compaction_log.requests();
+    assert_eq!(
+        compaction_requests.len(),
+        1,
+        "compaction provider sees the compaction request"
+    );
+    assert!(
+        compaction_requests[0].body_contains_text("USER_ONE"),
+        "compaction request carries the history"
+    );
+    let after = session_log.requests()[1].body_json();
+    let after_text = after["input"].to_string();
+    assert!(
+        after_text.contains(SUMMARY_TEXT),
+        "post-compaction request carries the summary from the compaction provider"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_compaction_summarizes_only_the_delta_and_concatenates() {
+    skip_if_no_network!();
+
+    let session_server = start_mock_server().await;
+    let compaction_server = start_mock_server().await;
+    let session_log = mount_sse_sequence(
+        &session_server,
+        vec![
+            // Crosses the 50% checkpoint threshold of a 100k window.
+            sse(vec![
+                ev_assistant_message("m0", "REPLY_ONE"),
+                ev_completed_with_tokens("r0", /*total_tokens*/ 60_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("m1", "REPLY_TWO"),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("m3", "REPLY_THREE"),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 200),
+            ]),
+        ],
+    )
+    .await;
+    let compaction_log = mount_sse_sequence(
+        &compaction_server,
+        vec![
+            sse(vec![
+                ev_assistant_message("c0", "CHECKPOINT_SUMMARY"),
+                ev_completed_with_tokens("c0", /*total_tokens*/ 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("c1", "DELTA_SUMMARY"),
+                ev_completed_with_tokens("c1", /*total_tokens*/ 100),
+            ]),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&session_server);
+    let compact_provider = non_openai_model_provider(&compaction_server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.compact_model_provider = Some(compact_provider);
+        config.model_context_window = Some(100_000);
+        config.model_auto_compact_token_limit = Some(90_000);
+        config.compact_checkpoint_threshold_percent = 50;
+        config.compact_prompt = Some("CUSTOM_COMPACT_INSTRUCTIONS".to_string());
+    });
+    let codex = builder
+        .build(&session_server)
+        .await
+        .expect("create conversation")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_ONE".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    // The checkpoint runs in the background on the compaction provider.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while compaction_log.requests().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "checkpoint request never reached the compaction provider"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Let the checkpoint response land in session state before continuing.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_TWO".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit second user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        compaction_log.requests().len(),
+        1,
+        "only one checkpoint is captured per context window"
+    );
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_THREE".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit third user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let compaction_requests = compaction_log.requests();
+    assert_eq!(compaction_requests.len(), 2);
+    let checkpoint_request = &compaction_requests[0];
+    assert!(checkpoint_request.body_contains_text("USER_ONE"));
+    assert!(checkpoint_request.body_contains_text("REPLY_ONE"));
+    assert!(!checkpoint_request.body_contains_text("USER_TWO"));
+    assert!(checkpoint_request.body_contains_text("CUSTOM_COMPACT_INSTRUCTIONS"));
+
+    let delta_request = &compaction_requests[1];
+    assert!(
+        !delta_request.body_contains_text("REPLY_ONE"),
+        "delta compaction must not resend items covered by the checkpoint"
+    );
+    assert!(delta_request.body_contains_text("USER_TWO"));
+    assert!(delta_request.body_contains_text("REPLY_TWO"));
+    assert!(
+        delta_request
+            .body_contains_text("<prior_checkpoint>\nCHECKPOINT_SUMMARY\n</prior_checkpoint>"),
+        "delta compaction gets the checkpoint summary as context"
+    );
+    assert!(delta_request.body_contains_text("CUSTOM_COMPACT_INSTRUCTIONS"));
+
+    let session_requests = session_log.requests();
+    assert_eq!(session_requests.len(), 3, "session provider never compacts");
+    let handover = session_requests[2].body_json()["input"].to_string();
+    let expected_summary = format!("{SUMMARY_PREFIX}\nCHECKPOINT_SUMMARY\n\nDELTA_SUMMARY");
+    assert!(
+        handover.contains(&expected_summary.replace('\n', "\\n")),
+        "handover concatenates checkpoint and delta summaries, got: {handover}"
+    );
+}
+
 #[test_case::test_case(false; "success")]
 #[test_case::test_case(true; "failure")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

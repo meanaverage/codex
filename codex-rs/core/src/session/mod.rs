@@ -1188,7 +1188,7 @@ impl Session {
     /// `ModelClient` is session-scoped and intentionally does not depend on the full `Config`, so
     /// we precompute the comma-separated list of enabled experimental feature keys at session
     /// creation time and thread it into the client. Remote compaction stays advertised unconditionally.
-    fn build_model_client_beta_features_header(config: &Config) -> Option<String> {
+    pub(crate) fn build_model_client_beta_features_header(config: &Config) -> Option<String> {
         Some(
             FEATURES
                 .iter()
@@ -4452,7 +4452,52 @@ impl Session {
 
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
         let mut state = self.state.lock().await;
+        // A new window invalidates any checkpoint captured for the old one.
+        state.compaction_checkpoint.reset();
         state.advance_auto_compact_window()
+    }
+
+    /// Records a checkpoint attempt for `window_number`; false when one was already made.
+    pub(crate) async fn begin_compaction_checkpoint(
+        &self,
+        window_number: u64,
+        handle: tokio_util::task::AbortOnDropHandle<()>,
+    ) -> bool {
+        self.state
+            .lock()
+            .await
+            .compaction_checkpoint
+            .try_begin(window_number, handle)
+    }
+
+    pub(crate) async fn finish_compaction_checkpoint(
+        &self,
+        checkpoint: Option<crate::compact_checkpoint::CompactionCheckpoint>,
+    ) {
+        self.state
+            .lock()
+            .await
+            .compaction_checkpoint
+            .finish(checkpoint);
+    }
+
+    /// Returns a valid checkpoint for `history` in the current window, if any.
+    pub(crate) async fn compaction_checkpoint_for(
+        &self,
+        history: &[codex_history::ResponseItemEnvelope],
+    ) -> Option<crate::compact_checkpoint::CompactionCheckpoint> {
+        let state = self.state.lock().await;
+        let window_number = state.auto_compact_window_number();
+        let checkpoint = state
+            .compaction_checkpoint
+            .ready_for(window_number, history)
+            .cloned();
+        if checkpoint.is_none() && state.compaction_checkpoint.has_ready() {
+            info!(
+                "compaction checkpoint is stale for the current history; summarizing the full history"
+            );
+        }
+        checkpoint
     }
 
     pub(crate) async fn request_new_context_window(&self) {

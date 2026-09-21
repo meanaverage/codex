@@ -91,6 +91,8 @@ pub(crate) struct SessionState {
     auto_compact_window: AutoCompactWindow,
     /// Original request effort for the current model while configuration updates remain active.
     pub(crate) reasoning_effort_pin: ReasoningEffortPin,
+    /// Background compaction checkpoint for the active auto-compaction window.
+    pub(crate) compaction_checkpoint: crate::compact_checkpoint::CompactionCheckpointState,
     /// Startup prewarmed session prepared during session initialization.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     /// Retained after completion so later turns do not repeat speculative captures.
@@ -133,6 +135,7 @@ impl SessionState {
             last_started_turn_id: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
             reasoning_effort_pin: ReasoningEffortPin::Unset,
+            compaction_checkpoint: Default::default(),
             startup_prewarm: None,
             shell_snapshot_prewarm: None,
             current_time_reminder: CurrentTimeReminderState::default(),

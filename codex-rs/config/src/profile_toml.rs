@@ -27,6 +27,9 @@ pub struct ConfigProfile {
     /// `default`, `priority`, or `flex`; legacy `fast` also works).
     pub service_tier: Option<String>,
     pub compact_service_tier: Option<String>,
+    pub compact_model: Option<String>,
+    pub compact_model_provider: Option<String>,
+    pub compact_checkpoint_threshold_percent: Option<u8>,
     /// The key in the `model_providers` map identifying the
     /// [`ModelProviderInfo`] to use.
     pub model_provider: Option<String>,

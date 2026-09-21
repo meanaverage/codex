@@ -117,12 +117,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
-    let prompt = turn_context
-        .config
-        .compact_prompt
-        .as_deref()
-        .unwrap_or(SUMMARIZATION_PROMPT)
-        .to_string();
+    let prompt = crate::compact_checkpoint::compaction_instructions(turn_context.as_ref());
     let input = vec![UserInput::Text {
         text: prompt,
         // Compaction prompt is synthesized; no UI element ranges to preserve.
@@ -256,24 +251,59 @@ async fn run_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
-    let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
+    // Compaction requests may run on a dedicated provider/model; `turn_context` stays the
+    // session's view for history bookkeeping and events.
+    let crate::compact_checkpoint::CompactionRequest {
+        turn_context: request_context,
+        mut client_session,
+    } = sess.compaction_request(&turn_context).await;
 
     let mut history = sess.clone_history().await;
-    history.record_items(
-        &[initial_input_for_turn.into()],
-        turn_context.model_info().truncation_policy.into(),
-    );
+    // With a valid background checkpoint, only the items recorded after it are summarized and
+    // the checkpoint summary is later concatenated in front of the result.
+    let checkpoint = sess
+        .compaction_checkpoint_for(history.annotated_items())
+        .await;
+    if let Some(checkpoint) = &checkpoint {
+        let instructions = input
+            .iter()
+            .filter_map(|input| match input {
+                UserInput::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let delta_items = history.annotated_items()[checkpoint.prefix.len()..].to_vec();
+        tracing::info!(
+            checkpoint_items = checkpoint.prefix.len(),
+            delta_items = delta_items.len(),
+            "compacting from checkpoint"
+        );
+        history = crate::compact_checkpoint::history_for_items(
+            &delta_items,
+            crate::compact_checkpoint::delta_compaction_instructions(
+                &checkpoint.summary,
+                &instructions,
+            ),
+            request_context.model_info(),
+        );
+    } else {
+        let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
+        history.record_items(
+            &[initial_input_for_turn.into()],
+            request_context.model_info().truncation_policy.into(),
+        );
+    }
 
-    let max_retries = turn_context.provider.info().stream_max_retries();
+    let max_retries = request_context.provider.info().stream_max_retries();
     let mut retries = 0;
-    // Reuse one client session so turn-scoped state (sticky routing and websocket incremental
+    // One client session is reused so turn-scoped state (sticky routing and websocket incremental
     // request tracking) survives retries within this compact turn.
-    let mut client_session = sess.services.model_client.new_session();
     let compaction_response = loop {
         // Clone is required because of the loop
         let mut turn_input = history
             .clone()
-            .for_prompt(&turn_context.model_info().input_modalities);
+            .for_prompt(&request_context.model_info().input_modalities);
         sess.services
             .executed_tool_calls
             .attach_to_compaction_prompt(&mut turn_input);
@@ -289,6 +319,7 @@ async fn run_compact_task_inner_impl(
         let attempt_result = drain_to_completed(
             &sess,
             turn_context.as_ref(),
+            request_context.as_ref(),
             &mut client_session,
             &responses_metadata,
             &prompt,
@@ -355,6 +386,12 @@ async fn run_compact_task_inner_impl(
             })?
     } else {
         get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default()
+    };
+    let summary_suffix = match &checkpoint {
+        Some(checkpoint) => {
+            crate::compact_checkpoint::concatenate_summaries(&checkpoint.summary, &summary_suffix)
+        }
+        None => summary_suffix,
     };
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let identity = if sess.guardian_context_mode == GuardianContextMode::ThreadOwned {
@@ -765,9 +802,13 @@ struct CompactionResponse {
     output: Vec<ResponseItem>,
 }
 
+/// `turn_context` is the session's view (history, events); `request_context` carries the model
+/// and provider the summarization request is sent to. They are the same unless a compaction
+/// provider or model is configured.
 async fn drain_to_completed(
     sess: &Session,
     turn_context: &TurnContext,
+    request_context: &TurnContext,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
@@ -776,11 +817,12 @@ async fn drain_to_completed(
     let mut stream = client_session
         .stream(
             prompt,
-            turn_context.model_info(),
-            &turn_context.session_telemetry,
-            sess.reasoning_effort_for_compaction(turn_context).await,
-            turn_context.reasoning_summary(),
-            turn_context.service_tier_for_compaction(turn_context.config.service_tier.clone()),
+            request_context.model_info(),
+            &request_context.session_telemetry,
+            sess.reasoning_effort_for_compaction(request_context).await,
+            request_context.reasoning_summary(),
+            request_context
+                .service_tier_for_compaction(request_context.config.service_tier.clone()),
             responses_metadata,
             // Rollout tracing currently models remote compaction only; local compaction streams
             // are left untraced until the reducer has a first-class local compaction lifecycle.

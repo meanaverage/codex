@@ -595,6 +595,15 @@ pub(crate) async fn run_turn(
                     );
                 }
 
+                // Capture a background compaction checkpoint once usage crosses the configured
+                // share of the window, unless compaction itself is about to run.
+                if token_status.checkpoint_threshold_reached
+                    && !token_limit_reached
+                    && !token_status.turn_end_compaction_threshold_reached
+                {
+                    sess.maybe_start_compaction_checkpoint(&turn_context).await;
+                }
+
                 let should_roll_over = needs_follow_up
                     && (sess.take_new_context_window_request().await || token_limit_reached);
                 let allow_auto_compact_fallback = !should_roll_over && !token_limit_reached;

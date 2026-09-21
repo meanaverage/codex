@@ -650,6 +650,17 @@
         "chatgpt_base_url": {
           "type": "string"
         },
+        "compact_checkpoint_threshold_percent": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "compact_model": {
+          "type": "string"
+        },
+        "compact_model_provider": {
+          "type": "string"
+        },
         "compact_model_reasoning_effort": {
           "$ref": "#/definitions/ReasoningEffort"
         },
@@ -6487,6 +6498,20 @@
         }
       ],
       "description": "Cloud-owned feature settings."
+    },
+    "compact_checkpoint_threshold_percent": {
+      "description": "Percentage of the model context window at which a background compaction checkpoint is captured (0-100). The checkpoint summarizes history so far on the compaction provider without touching the live context; the next real compaction then only summarizes what came after it and concatenates the two. `0` or unset disables checkpoints.",
+      "format": "uint8",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "compact_model": {
+      "description": "Optional model used only for local compaction requests. When unset, compaction uses the session model.",
+      "type": "string"
+    },
+    "compact_model_provider": {
+      "description": "Optional key into `model_providers` used only for local compaction requests, so summarization can run on a different server than the one serving the interactive session. When unset, compaction uses the session provider.",
+      "type": "string"
     },
     "compact_model_reasoning_effort": {
       "allOf": [

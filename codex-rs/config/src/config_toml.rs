@@ -414,6 +414,23 @@ pub struct ConfigToml {
     /// the session service tier.
     pub compact_service_tier: Option<String>,
 
+    /// Optional model used only for local compaction requests. When unset,
+    /// compaction uses the session model.
+    pub compact_model: Option<String>,
+
+    /// Optional key into `model_providers` used only for local compaction
+    /// requests, so summarization can run on a different server than the one
+    /// serving the interactive session. When unset, compaction uses the session
+    /// provider.
+    pub compact_model_provider: Option<String>,
+
+    /// Percentage of the model context window at which a background compaction
+    /// checkpoint is captured (0-100). The checkpoint summarizes history so far
+    /// on the compaction provider without touching the live context; the next
+    /// real compaction then only summarizes what came after it and concatenates
+    /// the two. `0` or unset disables checkpoints.
+    pub compact_checkpoint_threshold_percent: Option<u8>,
+
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
     pub chatgpt_base_url: Option<String>,
 

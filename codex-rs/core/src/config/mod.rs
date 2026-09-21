@@ -622,6 +622,16 @@ pub struct Config {
     /// When unset, compaction falls back to the session service tier.
     pub compact_service_tier: Option<String>,
 
+    /// Model used only for local compaction requests; `None` means the session model.
+    pub compact_model: Option<String>,
+
+    /// Provider used only for local compaction requests; `None` means the session provider.
+    pub compact_model_provider: Option<ModelProviderInfo>,
+
+    /// Context-window percentage at which a background compaction checkpoint is
+    /// captured on the compaction provider. `0` disables checkpoints.
+    pub compact_checkpoint_threshold_percent: u8,
+
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
 
@@ -3199,6 +3209,15 @@ impl Config {
 
         validate_model_providers(&cfg.model_providers)
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if cfg
+            .compact_checkpoint_threshold_percent
+            .is_some_and(|percent| percent > 100)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compact_checkpoint_threshold_percent must be between 0 and 100",
+            ));
+        }
         if cfg.model_post_turn_compact_threshold_percent.is_some_and(|percent| percent > 100) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -3769,6 +3788,20 @@ impl Config {
                 std::io::Error::new(std::io::ErrorKind::NotFound, message)
             })?
             .clone();
+        let compact_model_provider = match cfg.compact_model_provider.as_deref() {
+            Some(compact_provider_id) if compact_provider_id != model_provider_id => Some(
+                model_providers
+                    .get(compact_provider_id)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Compaction model provider `{compact_provider_id}` not found"),
+                        )
+                    })?
+                    .clone(),
+            ),
+            _ => None,
+        };
 
         let shell_environment_policy = ShellEnvironmentPolicy::from(cfg.shell_environment_policy);
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
@@ -4200,6 +4233,11 @@ impl Config {
             model,
             service_tier,
             compact_service_tier,
+            compact_model: cfg.compact_model.clone(),
+            compact_model_provider,
+            compact_checkpoint_threshold_percent: cfg
+                .compact_checkpoint_threshold_percent
+                .unwrap_or(0),
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
