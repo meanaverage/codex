@@ -284,6 +284,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         zsh_path: None,
         model_reasoning_effort: None,
         compact_model_reasoning_effort: None,
+        compact_service_tier: None,
         plan_mode_reasoning_effort: None,
         model_reasoning_summary: None,
         model_catalog: None,

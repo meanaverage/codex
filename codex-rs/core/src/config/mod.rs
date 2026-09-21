@@ -618,6 +618,10 @@ pub struct Config {
     /// `default` means the user explicitly selected standard routing.
     pub service_tier: Option<String>,
 
+    /// Effective service tier request id used only for compaction requests.
+    /// When unset, compaction falls back to the session service tier.
+    pub compact_service_tier: Option<String>,
+
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
 
@@ -3899,20 +3903,23 @@ impl Config {
 
         let model = model.or(cfg.model);
         let notices = cfg.notice.unwrap_or_default();
-        let service_tier = match service_tier_override {
+        let normalize_service_tier = |service_tier: Option<String>| {
+            service_tier.and_then(|service_tier| {
+                match ServiceTier::from_request_value(&service_tier) {
+                    Some(ServiceTier::Fast) => features
+                        .enabled(Feature::FastMode)
+                        .then(|| ServiceTier::Fast.request_value().to_string()),
+                    Some(ServiceTier::Flex) => Some(ServiceTier::Flex.request_value().to_string()),
+                    None => Some(service_tier),
+                }
+            })
+        };
+        let service_tier = normalize_service_tier(match service_tier_override {
             Some(Some(service_tier)) => Some(service_tier),
             Some(None) => Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
             None => cfg.service_tier,
-        };
-        let service_tier = service_tier.and_then(|service_tier| {
-            match ServiceTier::from_request_value(&service_tier) {
-                Some(ServiceTier::Fast) => features
-                    .enabled(Feature::FastMode)
-                    .then(|| ServiceTier::Fast.request_value().to_string()),
-                Some(ServiceTier::Flex) => Some(ServiceTier::Flex.request_value().to_string()),
-                None => Some(service_tier),
-            }
         });
+        let compact_service_tier = normalize_service_tier(cfg.compact_service_tier);
 
         let compact_prompt = compact_prompt.or(cfg.compact_prompt).and_then(|value| {
             let trimmed = value.trim();
@@ -4192,6 +4199,7 @@ impl Config {
         let config = Self {
             model,
             service_tier,
+            compact_service_tier,
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,

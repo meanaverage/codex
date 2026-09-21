@@ -405,7 +405,8 @@ async fn run_remote_compaction_request_v2(
                 &turn_context.session_telemetry,
                 sess.reasoning_effort_for_compaction(turn_context).await,
                 turn_context.reasoning_summary(),
-                step_context.settings.service_tier.clone(),
+                turn_context
+                    .service_tier_for_compaction(step_context.settings.service_tier.clone()),
                 responses_metadata,
                 &InferenceTraceContext::disabled(),
             )

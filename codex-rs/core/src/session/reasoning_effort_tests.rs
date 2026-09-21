@@ -223,3 +223,54 @@ async fn compaction_without_compact_effort_delegates_to_request_effort() {
         Some(ReasoningEffort::High),
     );
 }
+
+#[tokio::test]
+async fn compaction_service_tier_falls_back_to_session_tier_when_unset() {
+    let (_session, turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.service_tier = Some("flex".to_string());
+        },
+    )
+    .await;
+    assert_eq!(
+        turn_context.service_tier_for_compaction(Some("flex".to_string())),
+        Some("flex".to_string()),
+    );
+    assert_eq!(turn_context.service_tier_for_compaction(None), None);
+}
+
+#[tokio::test]
+async fn compaction_service_tier_overrides_session_tier() {
+    let (_session, turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.compact_service_tier = Some("flex".to_string());
+        },
+    )
+    .await;
+    assert_eq!(
+        turn_context.service_tier_for_compaction(Some("priority".to_string())),
+        Some("flex".to_string()),
+    );
+}
+
+#[tokio::test]
+async fn compaction_service_tier_priority_requires_fast_mode() {
+    let (_session, turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.features.disable(Feature::FastMode).unwrap();
+            config.compact_service_tier = Some("priority".to_string());
+        },
+    )
+    .await;
+    // Filtered out exactly like a sampling tier would be, not passed through raw.
+    assert_eq!(
+        turn_context.service_tier_for_compaction(Some("flex".to_string())),
+        None,
+    );
+}

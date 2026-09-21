@@ -653,6 +653,9 @@
         "compact_model_reasoning_effort": {
           "$ref": "#/definitions/ReasoningEffort"
         },
+        "compact_service_tier": {
+          "type": "string"
+        },
         "experimental_compact_prompt_file": {
           "$ref": "#/definitions/AbsolutePathBuf"
         },
@@ -6495,6 +6498,10 @@
     },
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",
+      "type": "string"
+    },
+    "compact_service_tier": {
+      "description": "Optional service tier request id used only for compaction requests. Accepts the same values as `service_tier`. When unset, compaction uses the session service tier.",
       "type": "string"
     },
     "computer_use": {

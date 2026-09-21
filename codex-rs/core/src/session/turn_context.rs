@@ -602,6 +602,23 @@ impl TurnContext {
         self.initial_settings.effective_reasoning_effort()
     }
 
+    /// Service tier for compaction requests: the configured `compact_service_tier`,
+    /// filtered by feature and model support exactly like a sampling tier, or the
+    /// caller's session tier when none is configured.
+    pub(crate) fn service_tier_for_compaction(
+        &self,
+        session_service_tier: Option<String>,
+    ) -> Option<String> {
+        let Some(compact_service_tier) = self.config.compact_service_tier.clone() else {
+            return session_service_tier;
+        };
+        super::get_service_tier(
+            Some(compact_service_tier),
+            self.config.features.enabled(Feature::FastMode),
+            self.model_info(),
+        )
+    }
+
     /// Legacy: returns the frozen initial-turn reasoning-effort label for tracing.
     /// Step-scoped consumers should use their captured `StepContext::settings`.
     pub(crate) fn effective_reasoning_effort_for_tracing(&self) -> String {

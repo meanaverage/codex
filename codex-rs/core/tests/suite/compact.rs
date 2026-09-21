@@ -1062,6 +1062,69 @@ async fn manual_compact_uses_compact_model_reasoning_effort() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_uses_compact_service_tier() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_assistant_message("m0", FIRST_REPLY),
+        ev_completed_with_tokens("r0", /*total_tokens*/ 80),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m1", SUMMARY_TEXT),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+    ]);
+    let after_turn = sse(vec![
+        ev_assistant_message("m2", "after compaction"),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 120),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, compact_turn, after_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.service_tier = None;
+        config.compact_service_tier = Some("flex".to_string());
+    });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create conversation")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_ONE".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_TWO".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit second user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.body_json()["service_tier"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(null), json!("flex"), json!(null)],
+        "only the compaction request should carry compact_service_tier"
+    );
+}
+
 #[test_case::test_case(false; "success")]
 #[test_case::test_case(true; "failure")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
