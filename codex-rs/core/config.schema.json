@@ -650,6 +650,9 @@
         "chatgpt_base_url": {
           "type": "string"
         },
+        "compact_model_reasoning_effort": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
         "experimental_compact_prompt_file": {
           "$ref": "#/definitions/AbsolutePathBuf"
         },
@@ -6481,6 +6484,14 @@
         }
       ],
       "description": "Cloud-owned feature settings."
+    },
+    "compact_model_reasoning_effort": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      ],
+      "description": "Optional reasoning effort used only for compaction requests. When unset, compaction shares the request effort of the active context window."
     },
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",

@@ -160,3 +160,66 @@ async fn unsupported_model_compaction_uses_selected_effort_without_mutating_pin(
         Some(ReasoningEffort::High),
     );
 }
+
+#[tokio::test]
+async fn compaction_uses_configured_compact_effort_without_touching_pin() {
+    let (session, turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .features
+                .enable(Feature::ReasoningEffortOverride)
+                .unwrap();
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+            config.compact_model_reasoning_effort = Some(ReasoningEffort::None);
+        },
+    )
+    .await;
+    let slug = turn_context.initial_settings.model_info.slug.clone();
+    session
+        .state
+        .lock()
+        .await
+        .reasoning_effort_pin
+        .pin(&slug, ReasoningEffort::High);
+
+    assert_eq!(
+        session.reasoning_effort_for_compaction(&turn_context).await,
+        Some(ReasoningEffort::None),
+    );
+    assert_eq!(
+        session.state.lock().await.reasoning_effort_pin.get(&slug),
+        Some(ReasoningEffort::High),
+    );
+}
+
+#[tokio::test]
+async fn compaction_without_compact_effort_delegates_to_request_effort() {
+    let (session, turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .features
+                .enable(Feature::ReasoningEffortOverride)
+                .unwrap();
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+        },
+    )
+    .await;
+
+    assert_eq!(
+        session.reasoning_effort_for_compaction(&turn_context).await,
+        session
+            .reasoning_effort_for_request(
+                &turn_context.initial_settings,
+                RequestEffortUsage::Compaction
+            )
+            .await,
+    );
+    assert_eq!(
+        session.reasoning_effort_for_compaction(&turn_context).await,
+        Some(ReasoningEffort::High),
+    );
+}

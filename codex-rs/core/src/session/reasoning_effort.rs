@@ -9,6 +9,7 @@
 use super::session::Session;
 use super::step_context::StepContext;
 use super::step_settings::ResolvedStepSettings;
+use super::turn_context::TurnContext;
 use crate::state::ReasoningEffortPin;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
@@ -88,6 +89,28 @@ impl Session {
             }],
         )
         .await;
+    }
+
+    /// Compaction uses the dedicated `compact_model_reasoning_effort` when one is
+    /// configured; otherwise it shares the request effort for this context window.
+    /// The dedicated effort never touches the live pin, so a failed compaction
+    /// leaves sampling requests exactly as they were.
+    pub(crate) async fn reasoning_effort_for_compaction(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Option<ReasoningEffort> {
+        if let Some(effort) = turn_context.config.compact_model_reasoning_effort.as_ref() {
+            return Some(
+                turn_context
+                    .model_info()
+                    .resolve_reasoning_effort(effort.clone()),
+            );
+        }
+        self.reasoning_effort_for_request(
+            &turn_context.initial_settings,
+            RequestEffortUsage::Compaction,
+        )
+        .await
     }
 
     /// Sampling and compaction share the original request effort for this context window.

@@ -997,6 +997,145 @@ async fn manual_compact_uses_custom_prompt() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_uses_compact_model_reasoning_effort() {
+    use codex_protocol::openai_models::ReasoningEffort;
+
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_assistant_message("m0", FIRST_REPLY),
+        ev_completed_with_tokens("r0", /*total_tokens*/ 80),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m1", SUMMARY_TEXT),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+    ]);
+    let after_turn = sse(vec![
+        ev_assistant_message("m2", "after compaction"),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 120),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, compact_turn, after_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_reasoning_effort = Some(ReasoningEffort::High);
+        config.compact_model_reasoning_effort = Some(ReasoningEffort::Low);
+    });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create conversation")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_ONE".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_TWO".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit second user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.body_json()["reasoning"]["effort"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("high"), json!("low"), json!("high")],
+        "only the compaction request should use compact_model_reasoning_effort"
+    );
+}
+
+#[test_case::test_case(false; "success")]
+#[test_case::test_case(true; "failure")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_v2_compaction_uses_compact_model_reasoning_effort(
+    fail_compaction: bool,
+) -> Result<()> {
+    use codex_protocol::openai_models::ReasoningEffort;
+
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", "first reply"),
+                ev_completed("r1"),
+            ]),
+            if fail_compaction {
+                sse_failed("r2", "server_error", "compaction failed")
+            } else {
+                remote_v2_compaction_response()
+            },
+            sse(vec![
+                ev_assistant_message("m3", "second reply"),
+                ev_completed("r3"),
+            ]),
+        ],
+    )
+    .await;
+
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model_info_override("gpt-5.4", |model| {
+            model.use_responses_lite = true;
+            model.supports_reasoning_effort_updates = true;
+        })
+        .with_config(move |config| {
+            config.model_provider.stream_max_retries = Some(0);
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+            config.compact_model_reasoning_effort = Some(ReasoningEffort::Low);
+            config
+                .features
+                .enable(Feature::ReasoningEffortOverride)
+                .expect("test config should allow feature update");
+            set_test_compact_prompt(config);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_text_turn("first message").await?;
+    test.codex.submit(Op::Compact).await?;
+    if fail_compaction {
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
+    }
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.submit_text_turn("after compaction").await?;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.body_json()["reasoning"]["effort"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("high"), json!("low"), json!("high")],
+        "compaction uses the compact effort; sampling keeps its own effort whether or not compaction succeeds"
+    );
+    Ok(())
+}
+
 #[test_case::test_case(false; "success")]
 #[test_case::test_case(true; "failure")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

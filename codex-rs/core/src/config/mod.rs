@@ -971,6 +971,13 @@ pub struct Config {
     /// Value to use for `reasoning.effort` when making a request using the
     /// Responses API.
     pub model_reasoning_effort: Option<ReasoningEffort>,
+    /// Value to use for `reasoning.effort` on compaction requests only.
+    ///
+    /// When unset, compaction shares the request effort established for the
+    /// active context window. When set (including `none`), compaction uses
+    /// this effort regardless of the sampling effort, trading prompt-cache
+    /// reuse for a cheaper or faster summarization request.
+    pub compact_model_reasoning_effort: Option<ReasoningEffort>,
     /// Optional Plan-mode-specific reasoning effort override used by the TUI.
     ///
     /// When unset, Plan mode uses the built-in Plan preset default (currently
@@ -4312,6 +4319,7 @@ impl Config {
             guardian_policy_config,
             guardian_policy_template,
             model_reasoning_effort: cfg.model_reasoning_effort,
+            compact_model_reasoning_effort: cfg.compact_model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_catalog,
