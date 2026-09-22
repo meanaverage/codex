@@ -4458,16 +4458,19 @@ impl Session {
     }
 
     /// Records a checkpoint attempt for `window_number`; false when one was already made.
-    pub(crate) async fn begin_compaction_checkpoint(
-        &self,
-        window_number: u64,
-        handle: tokio_util::task::AbortOnDropHandle<()>,
-    ) -> bool {
+    pub(crate) async fn reserve_compaction_checkpoint(&self, window_number: u64) -> bool {
         self.state
             .lock()
             .await
             .compaction_checkpoint
-            .try_begin(window_number, handle)
+            .reserve(window_number)
+    }
+
+    pub(crate) async fn begin_compaction_checkpoint(
+        &self,
+        handle: tokio_util::task::AbortOnDropHandle<()>,
+    ) {
+        self.state.lock().await.compaction_checkpoint.begin(handle);
     }
 
     pub(crate) async fn finish_compaction_checkpoint(

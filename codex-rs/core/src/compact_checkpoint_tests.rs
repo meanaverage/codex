@@ -28,26 +28,25 @@ fn idle_handle() -> AbortOnDropHandle<()> {
 #[tokio::test]
 async fn one_checkpoint_attempt_per_window() {
     let mut state = CompactionCheckpointState::default();
-    assert!(state.try_begin(1, idle_handle()));
-    assert!(!state.try_begin(1, idle_handle()));
+    assert!(state.reserve(1));
+    state.begin(idle_handle());
+    assert!(!state.reserve(1));
     state.finish(None);
     assert!(
-        !state.try_begin(1, idle_handle()),
+        !state.reserve(1),
         "a failed attempt is not retried in the same window"
     );
-    assert!(state.try_begin(2, idle_handle()));
+    assert!(state.reserve(2));
     state.reset();
-    assert!(
-        state.try_begin(2, idle_handle()),
-        "reset allows a fresh attempt"
-    );
+    assert!(state.reserve(2), "reset allows a fresh attempt");
 }
 
 #[tokio::test]
 async fn ready_checkpoint_requires_matching_window_and_prefix() {
     let prefix = vec![message("user", "one"), message("assistant", "two")];
     let mut state = CompactionCheckpointState::default();
-    assert!(state.try_begin(3, idle_handle()));
+    assert!(state.reserve(3));
+    state.begin(idle_handle());
     state.finish(Some(CompactionCheckpoint {
         window_number: 3,
         prefix: Arc::new(prefix.clone()),

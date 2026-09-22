@@ -18,6 +18,7 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use futures::prelude::*;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -44,6 +45,9 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::openai_models::ModelInfo;
 use codex_rollout_trace::InferenceTraceContext;
 
+/// Upper bound for one checkpoint capture, including retries.
+const CHECKPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
 /// A completed checkpoint: the summarized history prefix and its summary.
 #[derive(Debug, Clone)]
 pub(crate) struct CompactionCheckpoint {
@@ -67,14 +71,19 @@ pub(crate) struct CompactionCheckpointState {
 
 impl CompactionCheckpointState {
     /// Marks this window as attempted and returns whether a capture may start.
-    pub(crate) fn try_begin(&mut self, window_number: u64, handle: AbortOnDropHandle<()>) -> bool {
+    pub(crate) fn reserve(&mut self, window_number: u64) -> bool {
         if self.attempted_window == Some(window_number) {
             return false;
         }
         self.attempted_window = Some(window_number);
         self.ready = None;
-        self.running = Some(handle);
+        self.running = None;
         true
+    }
+
+    /// Stores the in-flight capture so dropping the state aborts it.
+    pub(crate) fn begin(&mut self, handle: AbortOnDropHandle<()>) {
+        self.running = Some(handle);
     }
 
     pub(crate) fn finish(&mut self, checkpoint: Option<CompactionCheckpoint>) {
@@ -129,15 +138,24 @@ impl Session {
             };
         }
 
-        // `with_model` is the only owned-copy constructor for a turn context; reusing the
-        // session model keeps its settings while giving us a context we can rebind.
-        let model = config
-            .compact_model
+        let auth_manager = Some(Arc::clone(&self.services.auth_manager));
+        let provider = config
+            .compact_model_provider
             .clone()
-            .unwrap_or_else(|| turn_context.model_info().slug.clone());
-        let mut request_context = turn_context
-            .with_model(model, &self.services.models_manager)
-            .await;
+            .map(|provider_info| create_model_provider(provider_info, auth_manager.clone()))
+            .unwrap_or_else(|| turn_context.provider.clone());
+        let mut request_context = turn_context.with_provider(provider);
+        // Only a different compaction model needs the (catalog-refreshing) model re-resolution.
+        if let Some(model) = config.compact_model.clone()
+            && model != turn_context.model_info().slug
+        {
+            debug!(model, "resolving compaction model");
+            let provider = request_context.provider.clone();
+            request_context = request_context
+                .with_model(model, &self.services.models_manager)
+                .await;
+            request_context.provider = provider;
+        }
         let Some(provider_info) = config.compact_model_provider.clone() else {
             return CompactionRequest {
                 turn_context: Arc::new(request_context),
@@ -145,9 +163,6 @@ impl Session {
             };
         };
 
-        let auth_manager = Some(Arc::clone(&self.services.auth_manager));
-        request_context.provider =
-            create_model_provider(provider_info.clone(), auth_manager.clone());
         let client = ModelClient::new(
             auth_manager,
             if config.features.enabled(Feature::UseAgentIdentity) {
@@ -189,6 +204,9 @@ impl Session {
             return;
         }
         let (_, window_number, _) = self.current_window().await;
+        if !self.reserve_compaction_checkpoint(window_number).await {
+            return;
+        }
         let prefix = self.clone_history().await.into_shared_annotated_items();
         if prefix.is_empty() {
             return;
@@ -197,7 +215,18 @@ impl Session {
         let ctx = Arc::clone(turn_context);
         let items = Arc::clone(&prefix);
         let handle = AbortOnDropHandle::new(tokio::spawn(async move {
-            let result = capture_checkpoint(&sess, &ctx, window_number, items).await;
+            let result = match tokio::time::timeout(
+                CHECKPOINT_TIMEOUT,
+                capture_checkpoint(&sess, &ctx, window_number, items),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(CodexErr::Stream(format!(
+                    "compaction checkpoint timed out after {}s",
+                    CHECKPOINT_TIMEOUT.as_secs()
+                ))),
+            };
             let checkpoint = match result {
                 Ok(checkpoint) => {
                     info!(
@@ -224,16 +253,12 @@ impl Session {
             };
             sess.finish_compaction_checkpoint(checkpoint).await;
         }));
-        let started = self
-            .begin_compaction_checkpoint(window_number, handle)
-            .await;
-        if started {
-            info!(
-                window_number,
-                items = prefix.len(),
-                "compaction checkpoint started"
-            );
-        }
+        self.begin_compaction_checkpoint(handle).await;
+        info!(
+            window_number,
+            items = prefix.len(),
+            "compaction checkpoint started"
+        );
     }
 }
 
@@ -298,10 +323,16 @@ async fn capture_checkpoint(
     window_number: u64,
     prefix: Arc<Vec<ResponseItemEnvelope>>,
 ) -> CodexResult<CompactionCheckpoint> {
+    debug!("compaction checkpoint: building request context");
     let CompactionRequest {
         turn_context: request_context,
         mut client_session,
     } = sess.compaction_request(turn_context).await;
+    debug!(
+        provider = request_context.provider.info().name,
+        model = request_context.model_info().slug,
+        "compaction checkpoint: request context ready"
+    );
     let instructions = compaction_instructions(turn_context);
     let history = history_for_items(&prefix, instructions, request_context.model_info());
     let turn_input = history.for_prompt(&request_context.model_info().input_modalities);
@@ -324,6 +355,10 @@ async fn capture_checkpoint(
 
     let max_retries = request_context.provider.info().stream_max_retries();
     let mut retries = 0;
+    debug!(
+        input_items = prompt.input.len(),
+        "compaction checkpoint: sending request"
+    );
     let summary = loop {
         match stream_summary(
             sess,
