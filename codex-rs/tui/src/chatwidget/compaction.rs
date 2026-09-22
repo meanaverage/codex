@@ -89,19 +89,72 @@ impl ChatWidget {
         }
     }
 
-    /// `/squisher` with no argument: show the current target and the alternatives.
+    /// `/squisher` with no argument: open a picker over the configured providers.
     pub(super) fn show_compaction_provider(&mut self) {
-        let choices = self.compaction_provider_choices();
-        let hint = if choices.is_empty() {
-            "No other [model_providers] are configured; add one to route compaction elsewhere."
-                .to_string()
-        } else {
-            format!(
-                "Use /squisher <provider> to switch, or /squisher off for the session provider. Available: {}",
-                choices.join(", ")
-            )
-        };
-        self.add_info_message(self.compaction_provider_summary(), Some(hint));
+        let session_id = self.config.model_provider_id.clone();
+        let current_id = self
+            .config
+            .compact_model_provider
+            .as_ref()
+            .and_then(|current| {
+                self.config
+                    .model_providers
+                    .iter()
+                    .find(|(_, info)| {
+                        info.base_url == current.base_url && info.name == current.name
+                    })
+                    .map(|(key, _)| key.clone())
+            });
+
+        let mut items = Vec::new();
+        let session_provider = self.config.model_provider.clone();
+        items.push(SelectionItem {
+            name: format!("Session provider ({session_id})"),
+            description: Some(format!(
+                "Compact on the same server as the conversation: {}",
+                describe_provider(&session_provider)
+            )),
+            is_current: current_id.is_none(),
+            actions: vec![Box::new(|tx: &AppEventSender| {
+                tx.send(AppEvent::PersistCompactionProviderSelection { provider_id: None });
+            })],
+            dismiss_on_select: true,
+            search_value: Some(format!("off session {session_id}")),
+            ..Default::default()
+        });
+        for key in self.compaction_provider_choices() {
+            let Some(info) = self.config.model_providers.get(&key) else {
+                continue;
+            };
+            let provider_id = key.clone();
+            items.push(SelectionItem {
+                name: key.clone(),
+                description: Some(describe_provider(info)),
+                is_current: current_id.as_deref() == Some(key.as_str()),
+                actions: vec![Box::new(move |tx: &AppEventSender| {
+                    tx.send(AppEvent::PersistCompactionProviderSelection {
+                        provider_id: Some(provider_id.clone()),
+                    });
+                })],
+                dismiss_on_select: true,
+                search_value: Some(format!(
+                    "{key} {}",
+                    info.base_url.clone().unwrap_or_default()
+                )),
+                ..Default::default()
+            });
+        }
+        let initial_selected_idx = items.iter().position(|item| item.is_current);
+        self.show_selection_view(SelectionViewParams {
+            title: Some("Where should compaction run?".to_string()),
+            subtitle: Some(self.compaction_provider_summary()),
+            footer_hint: Some(standard_popup_hint_line()),
+            initial_selected_idx,
+            is_searchable: items.len() > 4,
+            search_placeholder: Some("Type to filter providers".to_string()),
+            items,
+            ..SelectionViewParams::picker()
+        });
     }
 
     /// `/squisher <provider|off>`: persist the compaction provider to the active config
