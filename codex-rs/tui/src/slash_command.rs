@@ -37,6 +37,7 @@ pub enum SlashCommand {
     App,
     Init,
     Compact,
+    Squisher,
     Recap,
     Plan,
     Voice,
@@ -93,6 +94,9 @@ impl SlashCommand {
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
+            SlashCommand::Squisher => {
+                "choose which model provider runs compaction (/squisher <provider|off>)"
+            }
             SlashCommand::Recap => "summarize the current conversation now",
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
@@ -177,6 +181,7 @@ impl SlashCommand {
                 | SlashCommand::Ide
                 | SlashCommand::Keymap
                 | SlashCommand::Mcp
+                | SlashCommand::Squisher
                 | SlashCommand::Export
                 | SlashCommand::Raw
                 | SlashCommand::Cd
@@ -290,6 +295,7 @@ impl SlashCommand {
             | SlashCommand::AutoReview
             | SlashCommand::Feedback
             | SlashCommand::Ide
+            | SlashCommand::Squisher
             | SlashCommand::Quit
             | SlashCommand::Exit
             | SlashCommand::Side

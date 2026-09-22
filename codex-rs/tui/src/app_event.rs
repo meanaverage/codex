@@ -1182,6 +1182,12 @@ pub(crate) enum AppEvent {
         voice: codex_protocol::protocol::RealtimeVoice,
     },
 
+    /// Save the compaction provider (`/squisher`) to the active config file; `None`
+    /// means compaction runs on the session provider.
+    PersistCompactionProviderSelection {
+        provider_id: Option<String>,
+    },
+
     /// Persist the selected service tier to the appropriate config.
     PersistServiceTierSelection {
         service_tier: Option<String>,

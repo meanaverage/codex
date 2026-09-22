@@ -76,6 +76,42 @@ impl App {
         }
     }
 
+    /// `/squisher`: write `compact_model_provider` into the active config file (the
+    /// profile file under `--profile`) and hot-reload running threads.
+    pub(super) async fn persist_compaction_provider(
+        &mut self,
+        app_server: &AppServerSession,
+        provider_id: Option<String>,
+    ) {
+        let edit = match provider_id.as_deref() {
+            Some(key) => crate::config_update::replace_config_value(
+                "compact_model_provider",
+                serde_json::json!(key),
+            ),
+            None => crate::config_update::clear_config_value("compact_model_provider"),
+        };
+        match crate::config_update::write_config_batch(app_server.request_handle(), vec![edit])
+            .await
+        {
+            Ok(response) => {
+                if response.status == codex_app_server_protocol::WriteStatus::OkOverridden {
+                    self.chat_widget.add_error_message(format!(
+                        "Compaction provider was saved but not applied: {}",
+                        super::config_persistence::overridden_write_message(&response),
+                    ));
+                    return;
+                }
+                self.config.compact_model_provider = provider_id
+                    .as_deref()
+                    .and_then(|key| self.config.model_providers.get(key).cloned());
+                self.chat_widget.on_compaction_provider_saved(provider_id);
+            }
+            Err(error) => self
+                .chat_widget
+                .add_error_message(format!("Failed to save compaction provider: {error}")),
+        }
+    }
+
     pub(super) async fn persist_realtime_voice(
         &mut self,
         app_server: &AppServerSession,

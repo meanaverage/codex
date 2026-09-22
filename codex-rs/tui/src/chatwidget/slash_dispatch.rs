@@ -291,6 +291,9 @@ impl ChatWidget {
                 const INIT_PROMPT: &str = include_str!("../../assets/prompt_for_init_command.md");
                 self.submit_user_message(INIT_PROMPT.to_string().into());
             }
+            SlashCommand::Squisher => {
+                self.show_compaction_provider();
+            }
             SlashCommand::Compact => {
                 if self.blocks_direct_input {
                     self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
@@ -798,6 +801,7 @@ impl ChatWidget {
                 "verbose" => self.add_mcp_output(McpServerStatusDetail::Full),
                 _ => self.add_error_message("Usage: /mcp [verbose]".to_string()),
             },
+            SlashCommand::Squisher => self.select_compaction_provider(trimmed),
             SlashCommand::Keymap => match trimmed.to_ascii_lowercase().as_str() {
                 "" => self.open_keymap_picker(),
                 "debug" => {
@@ -1221,6 +1225,7 @@ impl ChatWidget {
             | SlashCommand::Rename
             | SlashCommand::Voice
             | SlashCommand::Recap
+            | SlashCommand::Squisher
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Cd => match self.thread_id {
                 Some(thread_id) if self.can_change_working_directory(thread_id) => QueueDrain::Stop,

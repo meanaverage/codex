@@ -2070,6 +2070,16 @@ impl Session {
             config.mcp_servers = next_config.mcp_servers.clone();
             config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;
             config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;
+            // Compaction routing is not session-static: `/squisher` and config edits
+            // apply to the next checkpoint or compaction without a restart.
+            config.compact_model = next_config.compact_model.clone();
+            config.compact_model_provider = next_config.compact_model_provider.clone();
+            config.compact_model_reasoning_effort =
+                next_config.compact_model_reasoning_effort.clone();
+            config.compact_service_tier = next_config.compact_service_tier.clone();
+            config.compact_checkpoint_threshold_percent =
+                next_config.compact_checkpoint_threshold_percent;
+            config.compact_prompt = next_config.compact_prompt.clone();
             // Recording can follow rollout changes without changing the session's
             // execution features (including Code Mode's dispatch gate).
             if refresh_recording {

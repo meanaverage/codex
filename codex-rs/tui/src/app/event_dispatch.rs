@@ -2293,6 +2293,10 @@ impl App {
             AppEvent::PersistRealtimeVoiceSelection { voice } => {
                 self.persist_realtime_voice(app_server, voice).await;
             }
+            AppEvent::PersistCompactionProviderSelection { provider_id } => {
+                self.persist_compaction_provider(app_server, provider_id)
+                    .await;
+            }
             AppEvent::PersistServiceTierSelection { service_tier } => {
                 self.refresh_status_line();
                 self.config.service_tier = service_tier.clone();
