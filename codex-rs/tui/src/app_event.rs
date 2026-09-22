@@ -1182,10 +1182,18 @@ pub(crate) enum AppEvent {
         voice: codex_protocol::protocol::RealtimeVoice,
     },
 
-    /// Save the compaction provider (`/squisher`) to the active config file; `None`
-    /// means compaction runs on the session provider.
-    PersistCompactionProviderSelection {
+    /// Open the `/squisher` cadence sliders for a chosen compaction provider (`None`
+    /// means the session provider). Nothing is written until the sliders are accepted.
+    OpenCompactionCadence {
         provider_id: Option<String>,
+    },
+
+    /// Save `/squisher` settings to the active config file. `provider_id` `None` means
+    /// compaction runs on the session provider; `None` cadence fields are left unchanged.
+    PersistCompactionSettings {
+        provider_id: Option<String>,
+        checkpoint_percents: Option<Vec<u8>>,
+        trigger_percent: Option<u8>,
     },
 
     /// Persist the selected service tier to the appropriate config.

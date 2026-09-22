@@ -1,0 +1,14 @@
+---
+source: tui/src/bottom_pane/compaction_cadence_view_tests.rs
+expression: "rows(&view, 80)"
+---
+
+  Compaction cadence — SparkOps Qwen3.8 on DGX3+DGX4 (http://10.10.10.103:8078
+
+    Checkpoints  ◂ 2 ▸   (0–4; each stage summarizes what came after the previ
+
+  › checkpoint 1 ▕██████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▏  26%
+    checkpoint 2 ▕████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░▏  53%
+    compaction   ▕███████████████████████████████████████████░░░░░░░░░░░▏  80%
+
+  ↑↓ select  ←→ ±1  shift+← shift+→ ±5  enter save  esc cancel

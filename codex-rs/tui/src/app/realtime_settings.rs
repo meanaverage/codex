@@ -76,27 +76,39 @@ impl App {
         }
     }
 
-    /// `/squisher`: write `compact_model_provider` into the active config file (the
-    /// profile file under `--profile`) and hot-reload running threads.
-    pub(super) async fn persist_compaction_provider(
+    /// `/squisher`: write the compaction provider and cadence into the active config file
+    /// (the profile file under `--profile`) in one batch and hot-reload running threads.
+    pub(super) async fn persist_compaction_settings(
         &mut self,
         app_server: &AppServerSession,
         provider_id: Option<String>,
+        checkpoint_percents: Option<Vec<u8>>,
+        trigger_percent: Option<u8>,
     ) {
-        let edit = match provider_id.as_deref() {
+        let mut edits = vec![match provider_id.as_deref() {
             Some(key) => crate::config_update::replace_config_value(
                 "compact_model_provider",
                 serde_json::json!(key),
             ),
             None => crate::config_update::clear_config_value("compact_model_provider"),
-        };
-        match crate::config_update::write_config_batch(app_server.request_handle(), vec![edit])
-            .await
-        {
+        }];
+        if let Some(percents) = &checkpoint_percents {
+            edits.push(crate::config_update::replace_config_value(
+                "compact_checkpoint_percents",
+                serde_json::json!(percents),
+            ));
+        }
+        if let Some(percent) = trigger_percent {
+            edits.push(crate::config_update::replace_config_value(
+                "compact_trigger_percent",
+                serde_json::json!(percent),
+            ));
+        }
+        match crate::config_update::write_config_batch(app_server.request_handle(), edits).await {
             Ok(response) => {
                 if response.status == codex_app_server_protocol::WriteStatus::OkOverridden {
                     self.chat_widget.add_error_message(format!(
-                        "Compaction provider was saved but not applied: {}",
+                        "Compaction settings were saved but not applied: {}",
                         super::config_persistence::overridden_write_message(&response),
                     ));
                     return;
@@ -104,11 +116,21 @@ impl App {
                 self.config.compact_model_provider = provider_id
                     .as_deref()
                     .and_then(|key| self.config.model_providers.get(key).cloned());
-                self.chat_widget.on_compaction_provider_saved(provider_id);
+                if let Some(percents) = &checkpoint_percents {
+                    self.config.compact_checkpoint_percents = percents.clone();
+                }
+                if let Some(percent) = trigger_percent {
+                    self.config.compact_trigger_percent = percent;
+                }
+                self.chat_widget.on_compaction_settings_saved(
+                    provider_id,
+                    checkpoint_percents,
+                    trigger_percent,
+                );
             }
             Err(error) => self
                 .chat_widget
-                .add_error_message(format!("Failed to save compaction provider: {error}")),
+                .add_error_message(format!("Failed to save compaction settings: {error}")),
         }
     }
 

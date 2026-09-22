@@ -424,12 +424,19 @@ pub struct ConfigToml {
     /// provider.
     pub compact_model_provider: Option<String>,
 
-    /// Percentage of the model context window at which a background compaction
-    /// checkpoint is captured (0-100). The checkpoint summarizes history so far
-    /// on the compaction provider without touching the live context; the next
-    /// real compaction then only summarizes what came after it and concatenates
-    /// the two. `0` or unset disables checkpoints.
-    pub compact_checkpoint_threshold_percent: Option<u8>,
+    /// Context-window percentages (ascending, each below
+    /// `compact_trigger_percent`) at which background compaction checkpoints are
+    /// captured on the compaction provider. Each checkpoint summarizes only the
+    /// history recorded since the previous one; the real compaction then
+    /// summarizes the remainder and concatenates every stage into the handover.
+    /// Defaults to `[50]` when `compact_model_provider` is set and to none otherwise;
+    /// an empty list disables checkpoints.
+    pub compact_checkpoint_percents: Option<Vec<u8>>,
+
+    /// Context-window percentage at which automatic compaction runs (1-100).
+    /// Applied as a cap alongside `model_auto_compact_token_limit` and the
+    /// model catalog default. Defaults to `80`.
+    pub compact_trigger_percent: Option<u8>,
 
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
     pub chatgpt_base_url: Option<String>,

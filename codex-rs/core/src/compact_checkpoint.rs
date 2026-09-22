@@ -1,12 +1,13 @@
 //! Background compaction checkpoints.
 //!
-//! When `compact_checkpoint_threshold_percent` is set, a session that crosses that share of
-//! its context window captures a checkpoint: a snapshot of history so far is summarized on the
+//! Each entry of `compact_checkpoint_percents` is a stage. When a session crosses that share of
+//! its context window, the history recorded since the previous stage is summarized on the
 //! compaction provider (`compact_model_provider` / `compact_model`) without touching the live
-//! context. When real compaction later fires, only the items recorded after the checkpoint are
-//! summarized (with the checkpoint summary supplied as read-only context), and the two summaries
-//! are concatenated into the handover. One checkpoint is attempted per auto-compact window; a
-//! failed or stale checkpoint simply falls back to ordinary full compaction.
+//! context, with the earlier stage summaries supplied as read-only context. When real compaction
+//! fires, only the items after the last stage are summarized and every stage summary is
+//! concatenated into the handover. Each stage is attempted at most once per auto-compact window;
+//! a failed stage is skipped and its span is covered by the next stage or the final compaction,
+//! and a stale stage (history rewritten underneath it) falls back to full compaction.
 
 use std::sync::Arc;
 
@@ -39,6 +40,7 @@ use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
 use codex_features::Feature;
 use codex_login::auth::AgentIdentityAuthPolicy;
+use codex_model_provider::RemoteCompactionSupport;
 use codex_model_provider::create_model_provider;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -48,37 +50,45 @@ use codex_rollout_trace::InferenceTraceContext;
 /// Upper bound for one checkpoint capture, including retries.
 const CHECKPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
-/// A completed checkpoint: the summarized history prefix and its summary.
-#[derive(Debug, Clone)]
+/// A completed checkpoint stage: the history prefix it covers and the summary of the part of
+/// that prefix recorded after the previous stage.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CompactionCheckpoint {
-    /// Auto-compact window the checkpoint was captured in.
-    pub(crate) window_number: u64,
-    /// Exact history items the summary covers, oldest first.
+    /// Exact history items covered so far, oldest first (includes earlier stages' items).
     pub(crate) prefix: Arc<Vec<ResponseItemEnvelope>>,
-    /// Raw model output for the prefix, without `SUMMARY_PREFIX`.
+    /// Raw model output for this stage's span, without `SUMMARY_PREFIX`.
     pub(crate) summary: String,
 }
 
-/// Per-session checkpoint bookkeeping. Reset whenever a compaction succeeds.
+/// Per-session checkpoint bookkeeping for the active auto-compact window.
 #[derive(Default)]
 pub(crate) struct CompactionCheckpointState {
-    /// Window in which a checkpoint was last attempted; one attempt per window.
-    attempted_window: Option<u64>,
+    window_number: Option<u64>,
+    /// Highest stage attempted in this window; each stage runs at most once.
+    attempted_stage: Option<usize>,
     /// In-flight capture; dropping the handle aborts it.
     running: Option<AbortOnDropHandle<()>>,
-    ready: Option<CompactionCheckpoint>,
+    /// Completed stages, ascending; each prefix extends the previous one.
+    completed: Vec<CompactionCheckpoint>,
 }
 
 impl CompactionCheckpointState {
-    /// Marks this window as attempted and returns whether a capture may start.
-    pub(crate) fn reserve(&mut self, window_number: u64) -> bool {
-        if self.attempted_window == Some(window_number) {
-            return false;
+    /// Reserves `stage` for this window and returns the completed stages it builds on, or
+    /// `None` when the stage was already attempted or another capture is in flight.
+    pub(crate) fn reserve(
+        &mut self,
+        window_number: u64,
+        stage: usize,
+    ) -> Option<Vec<CompactionCheckpoint>> {
+        if self.window_number != Some(window_number) {
+            self.reset();
+            self.window_number = Some(window_number);
         }
-        self.attempted_window = Some(window_number);
-        self.ready = None;
-        self.running = None;
-        true
+        if self.running.is_some() || self.attempted_stage.is_some_and(|last| last >= stage) {
+            return None;
+        }
+        self.attempted_stage = Some(stage);
+        Some(self.completed.clone())
     }
 
     /// Stores the in-flight capture so dropping the state aborts it.
@@ -88,27 +98,32 @@ impl CompactionCheckpointState {
 
     pub(crate) fn finish(&mut self, checkpoint: Option<CompactionCheckpoint>) {
         self.running = None;
-        self.ready = checkpoint;
+        if let Some(checkpoint) = checkpoint {
+            self.completed.push(checkpoint);
+        }
     }
 
-    /// Returns the checkpoint if it still describes a prefix of `history`.
+    /// Returns the completed stages that still describe a prefix of `history`, ascending.
     pub(crate) fn ready_for(
         &self,
         window_number: u64,
         history: &[ResponseItemEnvelope],
-    ) -> Option<&CompactionCheckpoint> {
-        let checkpoint = self.ready.as_ref()?;
-        if checkpoint.window_number != window_number
-            || history.len() < checkpoint.prefix.len()
-            || history[..checkpoint.prefix.len()] != checkpoint.prefix[..]
-        {
-            return None;
+    ) -> Vec<CompactionCheckpoint> {
+        if self.window_number != Some(window_number) {
+            return Vec::new();
         }
-        Some(checkpoint)
+        self.completed
+            .iter()
+            .take_while(|checkpoint| {
+                history.len() >= checkpoint.prefix.len()
+                    && history[..checkpoint.prefix.len()] == checkpoint.prefix[..]
+            })
+            .cloned()
+            .collect()
     }
 
-    pub(crate) fn has_ready(&self) -> bool {
-        self.ready.is_some()
+    pub(crate) fn has_completed(&self) -> bool {
+        !self.completed.is_empty()
     }
 
     pub(crate) fn reset(&mut self) {
@@ -195,20 +210,33 @@ impl Session {
         }
     }
 
-    /// Starts a background checkpoint capture for the current window if none was attempted yet.
+    /// Starts a background capture for checkpoint `stage` unless it already ran this window.
     pub(crate) async fn maybe_start_compaction_checkpoint(
         self: &Arc<Self>,
         turn_context: &Arc<TurnContext>,
+        stage: usize,
     ) {
-        if turn_context.config.compact_checkpoint_threshold_percent == 0 {
+        // Remote (backend-side) compaction never consumes checkpoints, so only capture them
+        // when compaction runs locally or on a dedicated provider.
+        let config = &turn_context.config;
+        if config.compact_model_provider.is_none()
+            && !matches!(
+                turn_context.provider.capabilities().remote_compaction,
+                RemoteCompactionSupport::Unsupported
+            )
+        {
             return;
         }
         let (_, window_number, _) = self.current_window().await;
-        if !self.reserve_compaction_checkpoint(window_number).await {
+        let Some(prior) = self
+            .reserve_compaction_checkpoint(window_number, stage)
+            .await
+        else {
             return;
-        }
+        };
         let prefix = self.clone_history().await.into_shared_annotated_items();
-        if prefix.is_empty() {
+        let covered = prior.last().map_or(0, |last| last.prefix.len());
+        if prefix.len() <= covered {
             return;
         }
         let sess = Arc::clone(self);
@@ -217,7 +245,7 @@ impl Session {
         let handle = AbortOnDropHandle::new(tokio::spawn(async move {
             let result = match tokio::time::timeout(
                 CHECKPOINT_TIMEOUT,
-                capture_checkpoint(&sess, &ctx, window_number, items),
+                capture_checkpoint(&sess, &ctx, stage, prior, items),
             )
             .await
             {
@@ -231,6 +259,7 @@ impl Session {
                 Ok(checkpoint) => {
                     info!(
                         window_number,
+                        stage,
                         items = checkpoint.prefix.len(),
                         summary_chars = checkpoint.summary.len(),
                         "compaction checkpoint captured"
@@ -238,12 +267,13 @@ impl Session {
                     Some(checkpoint)
                 }
                 Err(err) => {
-                    warn!(error = %err, "compaction checkpoint failed; next compaction will summarize the full history");
+                    warn!(error = %err, stage, "compaction checkpoint failed; its span will be summarized by the next stage or compaction");
                     sess.send_event(
                         ctx.as_ref(),
                         EventMsg::Warning(WarningEvent {
                             message: format!(
-                                "Compaction checkpoint failed ({err}); the next compaction will summarize the full history."
+                                "Compaction checkpoint {} failed ({err}); its span will be summarized later.",
+                                stage + 1
                             ),
                         }),
                     )
@@ -256,7 +286,8 @@ impl Session {
         self.begin_compaction_checkpoint(handle).await;
         info!(
             window_number,
-            items = prefix.len(),
+            stage,
+            items = prefix.len() - covered,
             "compaction checkpoint started"
         );
     }
@@ -272,32 +303,36 @@ pub(crate) fn compaction_instructions(turn_context: &TurnContext) -> String {
         .to_string()
 }
 
-/// Instructions for summarizing only the portion of history recorded after a checkpoint.
-pub(crate) fn delta_compaction_instructions(
-    checkpoint_summary: &str,
-    instructions: &str,
-) -> String {
+/// Instructions for summarizing only the portion of history recorded after the checkpoints
+/// whose combined summary is `prior_summary`.
+pub(crate) fn delta_compaction_instructions(prior_summary: &str, instructions: &str) -> String {
     format!(
-        "A checkpoint summary of the earlier part of this conversation was already produced by a \
-previous compaction pass and is included below for reference only. It will be placed verbatim \
-before your output in the handover, so do not repeat or restate it. Apply the instructions that \
-follow it to the conversation items above this message, which are the portion recorded after \
-that checkpoint, and describe only what is new.\n\n\
-<prior_checkpoint>\n{checkpoint_summary}\n</prior_checkpoint>\n\n{instructions}"
+        "Checkpoint summaries of the earlier part of this conversation were already produced by \
+previous compaction passes and are included below for reference only. They will be placed \
+verbatim before your output in the handover, so do not repeat or restate them. Apply the \
+instructions that follow them to the conversation items above this message, which are the \
+portion recorded after the last checkpoint, and describe only what is new.\n\n\
+<prior_checkpoint>\n{prior_summary}\n</prior_checkpoint>\n\n{instructions}"
     )
 }
 
-/// Joins the checkpoint summary and the delta summary into one handover summary.
-pub(crate) fn concatenate_summaries(checkpoint_summary: &str, delta_summary: &str) -> String {
-    let checkpoint_summary = checkpoint_summary.trim();
-    let delta_summary = delta_summary.trim();
-    if delta_summary.is_empty() {
-        checkpoint_summary.to_string()
-    } else if checkpoint_summary.is_empty() {
-        delta_summary.to_string()
-    } else {
-        format!("{checkpoint_summary}\n\n{delta_summary}")
-    }
+/// Joins stage summaries (and the final delta summary) into one handover summary.
+pub(crate) fn concatenate_summaries<'a>(summaries: impl IntoIterator<Item = &'a str>) -> String {
+    summaries
+        .into_iter()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The combined summary of completed stages, in order.
+pub(crate) fn checkpoint_summary(checkpoints: &[CompactionCheckpoint]) -> String {
+    concatenate_summaries(
+        checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.summary.as_str()),
+    )
 }
 
 /// Builds a history containing only `items` plus the compaction instructions.
@@ -320,10 +355,11 @@ pub(crate) fn history_for_items(
 async fn capture_checkpoint(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    window_number: u64,
+    stage: usize,
+    prior: Vec<CompactionCheckpoint>,
     prefix: Arc<Vec<ResponseItemEnvelope>>,
 ) -> CodexResult<CompactionCheckpoint> {
-    debug!("compaction checkpoint: building request context");
+    debug!(stage, "compaction checkpoint: building request context");
     let CompactionRequest {
         turn_context: request_context,
         mut client_session,
@@ -333,8 +369,16 @@ async fn capture_checkpoint(
         model = request_context.model_info().slug,
         "compaction checkpoint: request context ready"
     );
-    let instructions = compaction_instructions(turn_context);
-    let history = history_for_items(&prefix, instructions, request_context.model_info());
+    let mut instructions = compaction_instructions(turn_context);
+    let covered = prior.last().map_or(0, |last| last.prefix.len());
+    if !prior.is_empty() {
+        instructions = delta_compaction_instructions(&checkpoint_summary(&prior), &instructions);
+    }
+    let history = history_for_items(
+        &prefix[covered..],
+        instructions,
+        request_context.model_info(),
+    );
     let turn_input = history.for_prompt(&request_context.model_info().input_modalities);
     let prompt = Prompt {
         input: turn_input,
@@ -383,11 +427,7 @@ async fn capture_checkpoint(
             "compaction checkpoint completed without an assistant summary".to_string(),
         ));
     }
-    Ok(CompactionCheckpoint {
-        window_number,
-        prefix,
-        summary,
-    })
+    Ok(CompactionCheckpoint { prefix, summary })
 }
 
 /// Streams one summarization request and returns the assistant's final message. Nothing is

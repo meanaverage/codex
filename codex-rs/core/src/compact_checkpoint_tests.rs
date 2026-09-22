@@ -26,56 +26,75 @@ fn idle_handle() -> AbortOnDropHandle<()> {
 }
 
 #[tokio::test]
-async fn one_checkpoint_attempt_per_window() {
+async fn stages_run_once_each_in_ascending_order() {
     let mut state = CompactionCheckpointState::default();
-    assert!(state.reserve(1));
+    assert_eq!(state.reserve(1, 0), Some(Vec::new()));
     state.begin(idle_handle());
-    assert!(!state.reserve(1));
+    assert_eq!(state.reserve(1, 1), None, "one capture at a time");
     state.finish(None);
-    assert!(
-        !state.reserve(1),
-        "a failed attempt is not retried in the same window"
-    );
-    assert!(state.reserve(2));
-    state.reset();
-    assert!(state.reserve(2), "reset allows a fresh attempt");
+    assert_eq!(state.reserve(1, 0), None, "a failed stage is not retried");
+    assert!(state.reserve(1, 1).is_some(), "the next stage still runs");
+    state.finish(None);
+    assert_eq!(state.reserve(2, 0), Some(Vec::new()), "a new window starts over");
 }
 
 #[tokio::test]
-async fn ready_checkpoint_requires_matching_window_and_prefix() {
-    let prefix = vec![message("user", "one"), message("assistant", "two")];
+async fn later_stage_builds_on_completed_stages() {
+    let first = vec![message("user", "one"), message("assistant", "two")];
     let mut state = CompactionCheckpointState::default();
-    assert!(state.reserve(3));
+    state.reserve(3, 0);
     state.begin(idle_handle());
     state.finish(Some(CompactionCheckpoint {
-        window_number: 3,
-        prefix: Arc::new(prefix.clone()),
-        summary: "summary".to_string(),
+        prefix: Arc::new(first),
+        summary: "first".to_string(),
+    }));
+    let prior = state.reserve(3, 1).expect("stage 1 reserved");
+    assert_eq!(prior.len(), 1);
+    assert_eq!(prior[0].summary, "first");
+}
+
+#[tokio::test]
+async fn ready_stages_require_matching_window_and_prefixes() {
+    let first = vec![message("user", "one"), message("assistant", "two")];
+    let mut second = first.clone();
+    second.push(message("user", "three"));
+    let mut state = CompactionCheckpointState::default();
+    state.reserve(3, 0);
+    state.finish(Some(CompactionCheckpoint {
+        prefix: Arc::new(first.clone()),
+        summary: "first".to_string(),
+    }));
+    state.reserve(3, 1);
+    state.finish(Some(CompactionCheckpoint {
+        prefix: Arc::new(second.clone()),
+        summary: "second".to_string(),
     }));
 
-    let mut history = prefix.clone();
-    history.push(message("user", "three"));
+    let mut history = second.clone();
+    history.push(message("assistant", "four"));
+    let summaries = |stages: Vec<CompactionCheckpoint>| {
+        stages
+            .into_iter()
+            .map(|stage| stage.summary)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(summaries(state.ready_for(3, &history)), vec!["first", "second"]);
+    assert!(state.ready_for(4, &history).is_empty(), "other window");
     assert_eq!(
-        state
-            .ready_for(3, &history)
-            .map(|checkpoint| checkpoint.summary.as_str()),
-        Some("summary")
-    );
-    assert!(state.ready_for(4, &history).is_none(), "other window");
-    assert!(
-        state.ready_for(3, &prefix[..1]).is_none(),
-        "history shorter than prefix"
+        summaries(state.ready_for(3, &first)),
+        vec!["first"],
+        "history shorter than the second prefix keeps only the first stage"
     );
     let mut rewritten = history.clone();
     rewritten[0] = message("user", "edited");
-    assert!(state.ready_for(3, &rewritten).is_none(), "rewritten prefix");
+    assert!(state.ready_for(3, &rewritten).is_empty(), "rewritten prefix");
 }
 
 #[test]
-fn concatenation_skips_empty_halves() {
-    assert_eq!(concatenate_summaries("a", "b"), "a\n\nb");
-    assert_eq!(concatenate_summaries("a\n", "  "), "a");
-    assert_eq!(concatenate_summaries("", "b"), "b");
+fn concatenation_skips_empty_parts() {
+    assert_eq!(concatenate_summaries(["a", "b"]), "a\n\nb");
+    assert_eq!(concatenate_summaries(["a\n", "  ", "c"]), "a\n\nc");
+    assert_eq!(concatenate_summaries(["", "b"]), "b");
 }
 
 #[test]

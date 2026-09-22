@@ -2,6 +2,8 @@
 //! and only a matching live completion contributes a duration to the transcript.
 
 use super::*;
+use crate::bottom_pane::compaction_cadence_view::CompactionCadence;
+use crate::bottom_pane::compaction_cadence_view::CompactionCadenceView;
 
 pub(super) const COMPACTION_HEADER: &str = "Compacting context";
 pub(super) const COMPACTION_DETAILS: &str = "Making room to continue.";
@@ -89,6 +91,54 @@ impl ChatWidget {
         }
     }
 
+    fn compaction_cadence_summary(&self) -> String {
+        let config = &self.config;
+        if config.compact_checkpoint_percents.is_empty() {
+            format!(
+                "No checkpoints; compaction at {}%.",
+                config.compact_trigger_percent
+            )
+        } else {
+            let stages = config
+                .compact_checkpoint_percents
+                .iter()
+                .map(|percent| format!("{percent}%"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Checkpoints at {stages}; compaction at {}%.",
+                config.compact_trigger_percent
+            )
+        }
+    }
+
+    /// Second step of `/squisher`: sliders for the checkpoint cadence, seeded from the
+    /// current config. The chosen provider is only written when the sliders are accepted.
+    pub(crate) fn open_compaction_cadence(&mut self, provider_id: Option<String>) {
+        let provider_label = match provider_id.as_deref() {
+            Some(key) => self
+                .config
+                .model_providers
+                .get(key)
+                .map(describe_provider)
+                .unwrap_or_else(|| key.to_string()),
+            None => format!(
+                "session provider, {}",
+                describe_provider(&self.config.model_provider)
+            ),
+        };
+        let view = CompactionCadenceView::new(
+            provider_id,
+            provider_label,
+            CompactionCadence {
+                checkpoint_percents: self.config.compact_checkpoint_percents.clone(),
+                trigger_percent: self.config.compact_trigger_percent,
+            },
+            self.app_event_tx.clone(),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
     /// `/squisher` with no argument: open a picker over the configured providers.
     pub(super) fn show_compaction_provider(&mut self) {
         let session_id = self.config.model_provider_id.clone();
@@ -116,7 +166,7 @@ impl ChatWidget {
             )),
             is_current: current_id.is_none(),
             actions: vec![Box::new(|tx: &AppEventSender| {
-                tx.send(AppEvent::PersistCompactionProviderSelection { provider_id: None });
+                tx.send(AppEvent::OpenCompactionCadence { provider_id: None });
             })],
             dismiss_on_select: true,
             search_value: Some(format!("off session {session_id}")),
@@ -132,7 +182,7 @@ impl ChatWidget {
                 description: Some(describe_provider(info)),
                 is_current: current_id.as_deref() == Some(key.as_str()),
                 actions: vec![Box::new(move |tx: &AppEventSender| {
-                    tx.send(AppEvent::PersistCompactionProviderSelection {
+                    tx.send(AppEvent::OpenCompactionCadence {
                         provider_id: Some(provider_id.clone()),
                     });
                 })],
@@ -147,7 +197,11 @@ impl ChatWidget {
         let initial_selected_idx = items.iter().position(|item| item.is_current);
         self.show_selection_view(SelectionViewParams {
             title: Some("Where should compaction run?".to_string()),
-            subtitle: Some(self.compaction_provider_summary()),
+            subtitle: Some(format!(
+                "{} {}",
+                self.compaction_provider_summary(),
+                self.compaction_cadence_summary()
+            )),
             footer_hint: Some(standard_popup_hint_line()),
             initial_selected_idx,
             is_searchable: items.len() > 4,
@@ -204,19 +258,36 @@ impl ChatWidget {
                 }
             }
         };
-        self.app_event_tx
-            .send(AppEvent::PersistCompactionProviderSelection {
-                provider_id: selection,
-            });
+        // A typed provider is a quick switch: keep the current cadence.
+        self.app_event_tx.send(AppEvent::PersistCompactionSettings {
+            provider_id: selection,
+            checkpoint_percents: None,
+            trigger_percent: None,
+        });
     }
 
-    /// Applies a persisted compaction provider to the widget's config copy and reports it.
-    pub(crate) fn on_compaction_provider_saved(&mut self, provider_id: Option<String>) {
+    /// Applies persisted compaction settings to the widget's config copy and reports them.
+    pub(crate) fn on_compaction_settings_saved(
+        &mut self,
+        provider_id: Option<String>,
+        checkpoint_percents: Option<Vec<u8>>,
+        trigger_percent: Option<u8>,
+    ) {
         self.config.compact_model_provider = provider_id
             .as_deref()
             .and_then(|key| self.config.model_providers.get(key).cloned());
+        if let Some(percents) = checkpoint_percents {
+            self.config.compact_checkpoint_percents = percents;
+        }
+        if let Some(percent) = trigger_percent {
+            self.config.compact_trigger_percent = percent;
+        }
         self.add_info_message(
-            self.compaction_provider_summary(),
+            format!(
+                "{} {}",
+                self.compaction_provider_summary(),
+                self.compaction_cadence_summary()
+            ),
             Some("Applies to the next compaction checkpoint or compaction.".to_string()),
         );
     }

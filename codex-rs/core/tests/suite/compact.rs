@@ -1255,7 +1255,8 @@ async fn checkpoint_compaction_summarizes_only_the_delta_and_concatenates() {
         config.compact_model_provider = Some(compact_provider);
         config.model_context_window = Some(100_000);
         config.model_auto_compact_token_limit = Some(90_000);
-        config.compact_checkpoint_threshold_percent = 50;
+        config.compact_checkpoint_percents = vec![50];
+        config.compact_trigger_percent = 100;
         config.compact_prompt = Some("CUSTOM_COMPACT_INSTRUCTIONS".to_string());
     });
     let codex = builder
@@ -1340,6 +1341,151 @@ async fn checkpoint_compaction_summarizes_only_the_delta_and_concatenates() {
     assert!(
         handover.contains(&expected_summary.replace('\n', "\\n")),
         "handover concatenates checkpoint and delta summaries, got: {handover}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_checkpoints_each_summarize_their_span_and_concatenate() {
+    skip_if_no_network!();
+
+    let session_server = start_mock_server().await;
+    let compaction_server = start_mock_server().await;
+    // Window is 100k with a 95% effective limit: stage 0 at 30% (28.5k), stage 1 at 60% (57k).
+    let session_log = mount_sse_sequence(
+        &session_server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m0", "REPLY_ONE"),
+                ev_completed_with_tokens("r0", /*total_tokens*/ 30_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("m1", "REPLY_TWO"),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 60_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", "REPLY_THREE"),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 70_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("m4", "REPLY_FOUR"),
+                ev_completed_with_tokens("r4", /*total_tokens*/ 200),
+            ]),
+        ],
+    )
+    .await;
+    let compaction_log = mount_sse_sequence(
+        &compaction_server,
+        vec![
+            sse(vec![
+                ev_assistant_message("c0", "STAGE_ONE"),
+                ev_completed_with_tokens("c0", /*total_tokens*/ 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("c1", "STAGE_TWO"),
+                ev_completed_with_tokens("c1", /*total_tokens*/ 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("c2", "DELTA_SUMMARY"),
+                ev_completed_with_tokens("c2", /*total_tokens*/ 100),
+            ]),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&session_server);
+    let compact_provider = non_openai_model_provider(&compaction_server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.compact_model_provider = Some(compact_provider);
+        config.model_context_window = Some(100_000);
+        config.model_auto_compact_token_limit = Some(90_000);
+        config.compact_checkpoint_percents = vec![30, 60];
+        config.compact_trigger_percent = 100;
+        config.compact_prompt = Some("CUSTOM_COMPACT_INSTRUCTIONS".to_string());
+    });
+    let codex = builder
+        .build(&session_server)
+        .await
+        .expect("create conversation")
+        .codex;
+
+    let submit = |text: &str| {
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }])
+    };
+    let wait_for_compaction_requests = |expected: usize| {
+        let compaction_log = compaction_log.clone();
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while compaction_log.requests().len() < expected {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "expected {expected} compaction requests"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // Let the checkpoint response land in session state before continuing.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    };
+
+    codex.start_or_steer_turn(submit("USER_ONE")).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_compaction_requests(1).await;
+    codex.start_or_steer_turn(submit("USER_TWO")).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_compaction_requests(2).await;
+    codex
+        .start_or_steer_turn(submit("USER_THREE"))
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        compaction_log.requests().len(),
+        2,
+        "stage 1 does not rerun once captured"
+    );
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    codex
+        .start_or_steer_turn(submit("USER_FOUR"))
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = compaction_log.requests();
+    assert_eq!(requests.len(), 3);
+    let stage_one = &requests[0];
+    assert!(stage_one.body_contains_text("USER_ONE"));
+    assert!(!stage_one.body_contains_text("USER_TWO"));
+    assert!(!stage_one.body_contains_text("<prior_checkpoint>"));
+
+    let stage_two = &requests[1];
+    assert!(
+        !stage_two.body_contains_text("REPLY_ONE"),
+        "stage 2 sends only its span"
+    );
+    assert!(stage_two.body_contains_text("USER_TWO"));
+    assert!(!stage_two.body_contains_text("USER_THREE"));
+    assert!(stage_two.body_contains_text("<prior_checkpoint>\nSTAGE_ONE\n</prior_checkpoint>"));
+
+    let delta = &requests[2];
+    assert!(
+        !delta.body_contains_text("REPLY_TWO"),
+        "delta sends only items after stage 2"
+    );
+    assert!(delta.body_contains_text("USER_THREE"));
+    assert!(
+        delta.body_contains_text("<prior_checkpoint>\nSTAGE_ONE\n\nSTAGE_TWO\n</prior_checkpoint>")
+    );
+
+    let handover = session_log.requests()[3].body_json()["input"].to_string();
+    let expected = format!("{SUMMARY_PREFIX}\nSTAGE_ONE\n\nSTAGE_TWO\n\nDELTA_SUMMARY");
+    assert!(
+        handover.contains(&expected.replace('\n', "\\n")),
+        "handover concatenates all stages, got: {handover}"
     );
 }
 
@@ -4990,6 +5136,7 @@ async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
             set_test_compact_prompt(config);
             config.model_context_window = Some(1_000);
             config.model_auto_compact_token_limit = Some(100);
+            config.compact_trigger_percent = 100;
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
         })
@@ -5078,6 +5225,7 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
             set_test_compact_prompt(config);
             config.model_context_window = Some(200_000);
             config.model_auto_compact_token_limit = Some(40);
+            config.compact_trigger_percent = 100;
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
         })
@@ -5162,6 +5310,7 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
             set_test_compact_prompt(config);
             config.model_context_window = Some(100);
             config.model_auto_compact_token_limit = Some(200);
+            config.compact_trigger_percent = 100;
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
         })

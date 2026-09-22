@@ -1275,6 +1275,7 @@ async fn remote_compact_v2_rewrites_multiple_trailing_function_call_outputs(
             .with_config(|config| {
                 config.model_context_window = Some(2_000);
                 config.model_auto_compact_token_limit = Some(200_000);
+                config.compact_trigger_percent = 100;
             }),
     )
     .await?;

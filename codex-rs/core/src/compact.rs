@@ -259,12 +259,12 @@ async fn run_compact_task_inner_impl(
     } = sess.compaction_request(&turn_context).await;
 
     let mut history = sess.clone_history().await;
-    // With a valid background checkpoint, only the items recorded after it are summarized and
-    // the checkpoint summary is later concatenated in front of the result.
-    let checkpoint = sess
-        .compaction_checkpoint_for(history.annotated_items())
+    // With valid background checkpoints, only the items recorded after the last one are
+    // summarized and the stage summaries are later concatenated in front of the result.
+    let checkpoints = sess
+        .compaction_checkpoints_for(history.annotated_items())
         .await;
-    if let Some(checkpoint) = &checkpoint {
+    if let Some(last_checkpoint) = checkpoints.last() {
         let instructions = input
             .iter()
             .filter_map(|input| match input {
@@ -273,16 +273,17 @@ async fn run_compact_task_inner_impl(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let delta_items = history.annotated_items()[checkpoint.prefix.len()..].to_vec();
+        let delta_items = history.annotated_items()[last_checkpoint.prefix.len()..].to_vec();
         tracing::info!(
-            checkpoint_items = checkpoint.prefix.len(),
+            stages = checkpoints.len(),
+            checkpoint_items = last_checkpoint.prefix.len(),
             delta_items = delta_items.len(),
-            "compacting from checkpoint"
+            "compacting from checkpoints"
         );
         history = crate::compact_checkpoint::history_for_items(
             &delta_items,
             crate::compact_checkpoint::delta_compaction_instructions(
-                &checkpoint.summary,
+                &crate::compact_checkpoint::checkpoint_summary(&checkpoints),
                 &instructions,
             ),
             request_context.model_info(),
@@ -387,11 +388,15 @@ async fn run_compact_task_inner_impl(
     } else {
         get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default()
     };
-    let summary_suffix = match &checkpoint {
-        Some(checkpoint) => {
-            crate::compact_checkpoint::concatenate_summaries(&checkpoint.summary, &summary_suffix)
-        }
-        None => summary_suffix,
+    let summary_suffix = if checkpoints.is_empty() {
+        summary_suffix
+    } else {
+        crate::compact_checkpoint::concatenate_summaries(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.summary.as_str())
+                .chain(std::iter::once(summary_suffix.as_str())),
+        )
     };
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let identity = if sess.guardian_context_mode == GuardianContextMode::ThreadOwned {

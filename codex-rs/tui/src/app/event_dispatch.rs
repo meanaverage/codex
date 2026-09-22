@@ -2293,9 +2293,21 @@ impl App {
             AppEvent::PersistRealtimeVoiceSelection { voice } => {
                 self.persist_realtime_voice(app_server, voice).await;
             }
-            AppEvent::PersistCompactionProviderSelection { provider_id } => {
-                self.persist_compaction_provider(app_server, provider_id)
-                    .await;
+            AppEvent::OpenCompactionCadence { provider_id } => {
+                self.chat_widget.open_compaction_cadence(provider_id);
+            }
+            AppEvent::PersistCompactionSettings {
+                provider_id,
+                checkpoint_percents,
+                trigger_percent,
+            } => {
+                self.persist_compaction_settings(
+                    app_server,
+                    provider_id,
+                    checkpoint_percents,
+                    trigger_percent,
+                )
+                .await;
             }
             AppEvent::PersistServiceTierSelection { service_tier } => {
                 self.refresh_status_line();

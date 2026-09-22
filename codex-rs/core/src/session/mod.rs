@@ -2077,8 +2077,8 @@ impl Session {
             config.compact_model_reasoning_effort =
                 next_config.compact_model_reasoning_effort.clone();
             config.compact_service_tier = next_config.compact_service_tier.clone();
-            config.compact_checkpoint_threshold_percent =
-                next_config.compact_checkpoint_threshold_percent;
+            config.compact_checkpoint_percents = next_config.compact_checkpoint_percents.clone();
+            config.compact_trigger_percent = next_config.compact_trigger_percent;
             config.compact_prompt = next_config.compact_prompt.clone();
             // Recording can follow rollout changes without changing the session's
             // execution features (including Code Mode's dispatch gate).
@@ -4467,13 +4467,18 @@ impl Session {
         state.advance_auto_compact_window()
     }
 
-    /// Records a checkpoint attempt for `window_number`; false when one was already made.
-    pub(crate) async fn reserve_compaction_checkpoint(&self, window_number: u64) -> bool {
+    /// Reserves checkpoint `stage` for `window_number`; returns the completed stages it
+    /// builds on, or `None` when it already ran or another capture is in flight.
+    pub(crate) async fn reserve_compaction_checkpoint(
+        &self,
+        window_number: u64,
+        stage: usize,
+    ) -> Option<Vec<crate::compact_checkpoint::CompactionCheckpoint>> {
         self.state
             .lock()
             .await
             .compaction_checkpoint
-            .reserve(window_number)
+            .reserve(window_number, stage)
     }
 
     pub(crate) async fn begin_compaction_checkpoint(
@@ -4494,23 +4499,22 @@ impl Session {
             .finish(checkpoint);
     }
 
-    /// Returns a valid checkpoint for `history` in the current window, if any.
-    pub(crate) async fn compaction_checkpoint_for(
+    /// Returns the completed checkpoint stages that still match `history`, ascending.
+    pub(crate) async fn compaction_checkpoints_for(
         &self,
         history: &[codex_history::ResponseItemEnvelope],
-    ) -> Option<crate::compact_checkpoint::CompactionCheckpoint> {
+    ) -> Vec<crate::compact_checkpoint::CompactionCheckpoint> {
         let state = self.state.lock().await;
         let window_number = state.auto_compact_window_number();
-        let checkpoint = state
+        let checkpoints = state
             .compaction_checkpoint
-            .ready_for(window_number, history)
-            .cloned();
-        if checkpoint.is_none() && state.compaction_checkpoint.has_ready() {
+            .ready_for(window_number, history);
+        if checkpoints.is_empty() && state.compaction_checkpoint.has_completed() {
             info!(
-                "compaction checkpoint is stale for the current history; summarizing the full history"
+                "compaction checkpoints are stale for the current history; summarizing the full history"
             );
         }
-        checkpoint
+        checkpoints
     }
 
     pub(crate) async fn request_new_context_window(&self) {

@@ -17,8 +17,9 @@ pub(crate) struct ContextWindowTokenStatus {
     pub(crate) full_context_window_limit_reached: bool,
     pub(crate) token_limit_reached: bool,
     pub(crate) turn_end_compaction_threshold_reached: bool,
-    /// Usage crossed `compact_checkpoint_threshold_percent` of the full context window.
-    pub(crate) checkpoint_threshold_reached: bool,
+    /// Highest index into `compact_checkpoint_percents` whose share of the full
+    /// context window is reached, if any.
+    pub(crate) checkpoint_stage_reached: Option<usize>,
 }
 
 fn tokens_remaining(limit: Option<i64>, used: i64) -> Option<i64> {
@@ -59,12 +60,25 @@ async fn context_window_token_status_with_config(
 ) -> ContextWindowTokenStatus {
     let active_context_tokens = sess.get_total_token_usage().await;
 
+    // The model's full context window is a hard cap, independent of the auto-compaction scope.
+    let full_context_window_limit = model_info.resolved_context_window().map(|context_window| {
+        context_window.saturating_mul(model_info.effective_context_window_percent) / 100
+    });
+    // `compact_trigger_percent` caps the trigger as a share of that window; explicit or
+    // catalog token limits still win when they are lower.
+    let trigger_cap = full_context_window_limit
+        .map(|limit| limit.saturating_mul(i64::from(config.compact_trigger_percent)) / 100);
+    let capped = |limit: Option<i64>| match (limit, trigger_cap) {
+        (Some(limit), Some(cap)) => Some(limit.min(cap)),
+        (limit, cap) => limit.or(cap),
+    };
+
     // Count either the full active context or only the tokens added after the initial prefix.
     let (auto_compact_scope_tokens, auto_compact_scope_limit, auto_compact_window_prefill_tokens) =
         match config.model_auto_compact_token_limit_scope {
             AutoCompactTokenLimitScope::Total => (
                 active_context_tokens,
-                model_info.auto_compact_token_limit(),
+                capped(model_info.auto_compact_token_limit()),
                 None,
             ),
             AutoCompactTokenLimitScope::BodyAfterPrefix => {
@@ -76,16 +90,11 @@ async fn context_window_token_status_with_config(
                     .or_else(|| model_info.auto_compact_token_limit());
                 (
                     active_context_tokens.saturating_sub(baseline),
-                    scope_limit,
+                    capped(scope_limit),
                     window.prefill_input_tokens,
                 )
             }
         };
-
-    // The model's full context window is a hard cap, independent of the auto-compaction scope.
-    let full_context_window_limit = model_info.resolved_context_window().map(|context_window| {
-        context_window.saturating_mul(model_info.effective_context_window_percent) / 100
-    });
 
     // Report remaining tokens against the base (unbuffered) window, capped by the full context.
     let base_window_tokens_remaining = [
@@ -110,12 +119,14 @@ async fn context_window_token_status_with_config(
     let token_limit_reached = buffered_auto_compact_limit
         .is_some_and(|limit| auto_compact_scope_tokens >= limit)
         || full_context_window_limit_reached;
-    let checkpoint_percent = config.compact_checkpoint_threshold_percent;
-    let checkpoint_threshold_reached = checkpoint_percent > 0
-        && full_context_window_limit.is_some_and(|limit| {
-            i128::from(active_context_tokens) * 100
-                >= i128::from(limit) * i128::from(checkpoint_percent)
-        });
+    let checkpoint_stage_reached = full_context_window_limit.and_then(|limit| {
+        config
+            .compact_checkpoint_percents
+            .iter()
+            .rposition(|percent| {
+                i128::from(active_context_tokens) * 100 >= i128::from(limit) * i128::from(*percent)
+            })
+    });
     let post_turn_percent = config.model_post_turn_compact_threshold_percent;
     let turn_end_compaction_threshold_reached = post_turn_percent > 0
         && (token_limit_reached
@@ -134,6 +145,6 @@ async fn context_window_token_status_with_config(
         full_context_window_limit_reached,
         token_limit_reached,
         turn_end_compaction_threshold_reached,
-        checkpoint_threshold_reached,
+        checkpoint_stage_reached,
     }
 }

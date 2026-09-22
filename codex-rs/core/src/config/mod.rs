@@ -217,6 +217,11 @@ pub use token_budget_startup::TokenBudgetStartupConfig;
 pub use windows_sandbox_config::PreparedWindowsSandboxConfig;
 pub use windows_sandbox_config::prepare_windows_sandbox_config;
 
+/// Compaction checkpoints run at these context-window percentages when a compaction provider
+/// is configured and no explicit stages are set.
+const DEFAULT_COMPACT_CHECKPOINT_PERCENTS: [u8; 1] = [50];
+/// Automatic compaction runs at this context-window percentage unless configured lower.
+const DEFAULT_COMPACT_TRIGGER_PERCENT: u8 = 80;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
 
@@ -628,9 +633,12 @@ pub struct Config {
     /// Provider used only for local compaction requests; `None` means the session provider.
     pub compact_model_provider: Option<ModelProviderInfo>,
 
-    /// Context-window percentage at which a background compaction checkpoint is
-    /// captured on the compaction provider. `0` disables checkpoints.
-    pub compact_checkpoint_threshold_percent: u8,
+    /// Ascending context-window percentages at which background compaction
+    /// checkpoints are captured. Empty disables checkpoints.
+    pub compact_checkpoint_percents: Vec<u8>,
+
+    /// Context-window percentage that caps the automatic compaction trigger.
+    pub compact_trigger_percent: u8,
 
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
@@ -3209,13 +3217,38 @@ impl Config {
 
         validate_model_providers(&cfg.model_providers)
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-        if cfg
-            .compact_checkpoint_threshold_percent
-            .is_some_and(|percent| percent > 100)
+        let compact_trigger_percent = cfg
+            .compact_trigger_percent
+            .unwrap_or(DEFAULT_COMPACT_TRIGGER_PERCENT);
+        if !(1..=100).contains(&compact_trigger_percent) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compact_trigger_percent must be between 1 and 100",
+            ));
+        }
+        // Checkpoints only pay off when they run somewhere other than the session server, so
+        // they default on only alongside a dedicated compaction provider.
+        let compact_checkpoint_percents = cfg.compact_checkpoint_percents.clone().unwrap_or_else(|| {
+            if cfg.compact_model_provider.is_some() {
+                DEFAULT_COMPACT_CHECKPOINT_PERCENTS.to_vec()
+            } else {
+                Vec::new()
+            }
+        });
+        let checkpoints_ascending = compact_checkpoint_percents
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]);
+        if !checkpoints_ascending
+            || compact_checkpoint_percents
+                .iter()
+                .any(|percent| *percent == 0 || *percent >= compact_trigger_percent)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "compact_checkpoint_threshold_percent must be between 0 and 100",
+                format!(
+                    "compact_checkpoint_percents must be strictly ascending and between 1 and {}",
+                    compact_trigger_percent - 1
+                ),
             ));
         }
         if cfg.model_post_turn_compact_threshold_percent.is_some_and(|percent| percent > 100) {
@@ -4235,9 +4268,8 @@ impl Config {
             compact_service_tier,
             compact_model: cfg.compact_model.clone(),
             compact_model_provider,
-            compact_checkpoint_threshold_percent: cfg
-                .compact_checkpoint_threshold_percent
-                .unwrap_or(0),
+            compact_checkpoint_percents,
+            compact_trigger_percent,
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
