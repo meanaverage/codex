@@ -1,6 +1,7 @@
 use super::CompactionCheckpoint;
 use super::CompactionCheckpointState;
 use super::concatenate_summaries;
+use super::merge_slice_summaries;
 use super::delta_compaction_instructions;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::ContentItem;
@@ -98,8 +99,50 @@ fn concatenation_skips_empty_parts() {
 }
 
 #[test]
-fn delta_instructions_embed_checkpoint_and_user_instructions() {
+fn delta_instructions_embed_earlier_slices_and_user_instructions() {
     let text = delta_compaction_instructions("PRIOR", "DO THIS");
-    assert!(text.contains("<prior_checkpoint>\nPRIOR\n</prior_checkpoint>"));
+    assert!(text.contains("<earlier_slices>\nPRIOR\n</earlier_slices>"));
+    assert!(text.contains("ONE SLICE"), "the slice framing must lead");
     assert!(text.ends_with("DO THIS"));
+}
+
+#[test]
+fn merging_slices_collects_each_section_once_in_template_order() {
+    let first = "## WHERE WE ARE\n\nParser landed.\n\n## WHAT'S LEFT\n\nWire the CLI.\n";
+    let second = "## WHAT'S LEFT\n\nCLI wired; docs remain.\n\n## DO NOT FORGET\n\nNever touch prod.\n";
+    let delta = "## WHERE WE ARE\n\nDocs drafted.\n";
+    assert_eq!(
+        merge_slice_summaries([first, second, delta]),
+        "## WHERE WE ARE\n\nParser landed.\n\nDocs drafted.\n\n\
+## WHAT'S LEFT\n\nWire the CLI.\n\nCLI wired; docs remain.\n\n\
+## DO NOT FORGET\n\nNever touch prod."
+    );
+}
+
+#[test]
+fn merging_keeps_preamble_and_ignores_empty_and_restyled_headings() {
+    let first = "Context follows.\n\n## Decisions\n\nUse TOML.\n";
+    // A slice may leave a section empty, restyle the heading, or add prose of its own.
+    let second = "More context.\n\n## decisions:\n\nStill TOML.\n\n## Artifacts\n\n";
+    assert_eq!(
+        merge_slice_summaries([first, second]),
+        "Context follows.\n\nMore context.\n\n## Decisions\n\nUse TOML.\n\nStill TOML."
+    );
+}
+
+#[test]
+fn merging_falls_back_to_concatenation_without_headings() {
+    assert_eq!(
+        merge_slice_summaries(["slice one", "slice two", "  "]),
+        "slice one\n\nslice two"
+    );
+}
+
+#[test]
+fn merging_ignores_hashes_inside_fenced_code() {
+    let slice = "## WHERE WE ARE\n\n```sh\n# not a heading\n```\n";
+    assert_eq!(
+        merge_slice_summaries([slice, "## WHERE WE ARE\n\nDone.\n"]),
+        "## WHERE WE ARE\n\n```sh\n# not a heading\n```\n\nDone."
+    );
 }

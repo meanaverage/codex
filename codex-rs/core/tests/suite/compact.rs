@@ -1329,7 +1329,7 @@ async fn checkpoint_compaction_summarizes_only_the_delta_and_concatenates() {
     assert!(delta_request.body_contains_text("REPLY_TWO"));
     assert!(
         delta_request
-            .body_contains_text("<prior_checkpoint>\nCHECKPOINT_SUMMARY\n</prior_checkpoint>"),
+            .body_contains_text("<earlier_slices>\nCHECKPOINT_SUMMARY\n</earlier_slices>"),
         "delta compaction gets the checkpoint summary as context"
     );
     assert!(delta_request.body_contains_text("CUSTOM_COMPACT_INSTRUCTIONS"));
@@ -1460,7 +1460,7 @@ async fn staged_checkpoints_each_summarize_their_span_and_concatenate() {
     let stage_one = &requests[0];
     assert!(stage_one.body_contains_text("USER_ONE"));
     assert!(!stage_one.body_contains_text("USER_TWO"));
-    assert!(!stage_one.body_contains_text("<prior_checkpoint>"));
+    assert!(!stage_one.body_contains_text("<earlier_slices>"));
 
     let stage_two = &requests[1];
     assert!(
@@ -1469,7 +1469,7 @@ async fn staged_checkpoints_each_summarize_their_span_and_concatenate() {
     );
     assert!(stage_two.body_contains_text("USER_TWO"));
     assert!(!stage_two.body_contains_text("USER_THREE"));
-    assert!(stage_two.body_contains_text("<prior_checkpoint>\nSTAGE_ONE\n</prior_checkpoint>"));
+    assert!(stage_two.body_contains_text("<earlier_slices>\nSTAGE_ONE\n</earlier_slices>"));
 
     let delta = &requests[2];
     assert!(
@@ -1478,7 +1478,7 @@ async fn staged_checkpoints_each_summarize_their_span_and_concatenate() {
     );
     assert!(delta.body_contains_text("USER_THREE"));
     assert!(
-        delta.body_contains_text("<prior_checkpoint>\nSTAGE_ONE\n\nSTAGE_TWO\n</prior_checkpoint>")
+        delta.body_contains_text("<earlier_slices>\nSTAGE_ONE\n\nSTAGE_TWO\n</earlier_slices>")
     );
 
     let handover = session_log.requests()[3].body_json()["input"].to_string();

@@ -249,6 +249,7 @@ async fn run_compact_task_inner_impl(
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    let started_at = Instant::now();
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
     // Compaction requests may run on a dedicated provider/model; `turn_context` stays the
@@ -274,10 +275,16 @@ async fn run_compact_task_inner_impl(
             .collect::<Vec<_>>()
             .join("\n");
         let delta_items = history.annotated_items()[last_checkpoint.prefix.len()..].to_vec();
+        // Logged from the turn task so the stage sizes are recorded even if a background
+        // capture's own events were lost.
         tracing::info!(
             stages = checkpoints.len(),
             checkpoint_items = last_checkpoint.prefix.len(),
             delta_items = delta_items.len(),
+            stage_summary_chars = ?checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.summary.len())
+                .collect::<Vec<_>>(),
             "compacting from checkpoints"
         );
         history = crate::compact_checkpoint::history_for_items(
@@ -391,7 +398,7 @@ async fn run_compact_task_inner_impl(
     let summary_suffix = if checkpoints.is_empty() {
         summary_suffix
     } else {
-        crate::compact_checkpoint::concatenate_summaries(
+        crate::compact_checkpoint::merge_slice_summaries(
             checkpoints
                 .iter()
                 .map(|checkpoint| checkpoint.summary.as_str())
@@ -399,6 +406,7 @@ async fn run_compact_task_inner_impl(
         )
     };
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+    let summary_chars = summary_text.len();
     let identity = if sess.guardian_context_mode == GuardianContextMode::ThreadOwned {
         CompactedMessageIdentity::Preserve
     } else {
@@ -441,6 +449,14 @@ async fn run_compact_task_inner_impl(
     )
     .await;
     sess.recompute_token_usage(&turn_context).await;
+    // The turn is blocked for this whole span; record it so the cost of compaction is
+    // measurable without inferring it from request timestamps.
+    tracing::info!(
+        elapsed_ms = started_at.elapsed().as_millis(),
+        stages = checkpoints.len(),
+        summary_chars,
+        "compaction complete"
+    );
 
     sess.emit_turn_item_completed(&turn_context, compaction_item)
         .await;

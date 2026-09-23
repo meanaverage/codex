@@ -18,9 +18,12 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use futures::prelude::*;
+use std::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument;
 use tracing::debug;
 use tracing::info;
+use tracing::info_span;
 use tracing::warn;
 
 use crate::Prompt;
@@ -242,7 +245,18 @@ impl Session {
         let sess = Arc::clone(self);
         let ctx = Arc::clone(turn_context);
         let items = Arc::clone(&prefix);
-        let handle = AbortOnDropHandle::new(tokio::spawn(async move {
+        let span_items = prefix.len() - covered;
+        // The capture outlives this turn, so give it its own span: without one its events are
+        // not attributed to the session and can be dropped by the log sink.
+        let span = info_span!(
+            "compaction_checkpoint",
+            stage,
+            window_number,
+            items = span_items
+        );
+        let handle = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+            let started_at = Instant::now();
             let result = match tokio::time::timeout(
                 CHECKPOINT_TIMEOUT,
                 capture_checkpoint(&sess, &ctx, stage, prior, items),
@@ -255,11 +269,11 @@ impl Session {
                     CHECKPOINT_TIMEOUT.as_secs()
                 ))),
             };
+            let elapsed_ms = started_at.elapsed().as_millis();
             let checkpoint = match result {
                 Ok(checkpoint) => {
                     info!(
-                        window_number,
-                        stage,
+                        elapsed_ms,
                         items = checkpoint.prefix.len(),
                         summary_chars = checkpoint.summary.len(),
                         "compaction checkpoint captured"
@@ -267,7 +281,7 @@ impl Session {
                     Some(checkpoint)
                 }
                 Err(err) => {
-                    warn!(error = %err, stage, "compaction checkpoint failed; its span will be summarized by the next stage or compaction");
+                    warn!(error = %err, elapsed_ms, "compaction checkpoint failed; its span will be summarized by the next stage or compaction");
                     sess.send_event(
                         ctx.as_ref(),
                         EventMsg::Warning(WarningEvent {
@@ -282,12 +296,14 @@ impl Session {
                 }
             };
             sess.finish_compaction_checkpoint(checkpoint).await;
-        }));
+            }
+            .instrument(span),
+        ));
         self.begin_compaction_checkpoint(handle).await;
         info!(
             window_number,
             stage,
-            items = prefix.len() - covered,
+            items = span_items,
             "compaction checkpoint started"
         );
     }
@@ -307,13 +323,124 @@ pub(crate) fn compaction_instructions(turn_context: &TurnContext) -> String {
 /// whose combined summary is `prior_summary`.
 pub(crate) fn delta_compaction_instructions(prior_summary: &str, instructions: &str) -> String {
     format!(
-        "Checkpoint summaries of the earlier part of this conversation were already produced by \
-previous compaction passes and are included below for reference only. They will be placed \
-verbatim before your output in the handover, so do not repeat or restate them. Apply the \
-instructions that follow them to the conversation items above this message, which are the \
-portion recorded after the last checkpoint, and describe only what is new.\n\n\
-<prior_checkpoint>\n{prior_summary}\n</prior_checkpoint>\n\n{instructions}"
+        "You are writing ONE SLICE of a multi-part handover, not the whole handover.\n\n\
+The earlier slices are already written and are reproduced verbatim below. They are kept \
+word-for-word and placed before your output, so every fact in them is already preserved. They \
+are here so you can resolve references such as \"the fix\" or \"that file\"; they are not \
+material to summarize.\n\n\
+Your slice covers only the conversation items above this message — the portion recorded after \
+the last slice. Rules for your output:\n\
+- Write only what the earlier slices do not already say. Never restate, re-explain, or \
+  re-list anything found in them, even under a different heading.\n\
+- Include a section heading only when your slice has new content for it, and omit every \
+  section that has nothing new. A short slice should be short; a slice with nothing new is a \
+  single line saying so.\n\
+- When your slice supersedes something in an earlier slice (a value changed, an approach was \
+  abandoned, a task finished), say only what changed and name the thing it replaces.\n\
+- Do not write a preamble, a recap, or a closing summary of the whole conversation.\n\n\
+<earlier_slices>\n{prior_summary}\n</earlier_slices>\n\n\
+Apply the following instructions to your slice only, subject to the rules above:\n\n\
+{instructions}"
     )
+}
+
+/// Assembles slice summaries into one handover document by merging their sections.
+///
+/// Each slice is written against the same template, so stacking them whole would repeat every
+/// heading once per slice. Instead the sections are merged: a heading keeps the position of its
+/// first appearance and collects each slice's content under it, in slice order. Text before a
+/// slice's first heading is kept as a preamble. Slices that use no headings fall back to plain
+/// concatenation, so a free-form compaction prompt still produces a readable handover.
+pub(crate) fn merge_slice_summaries<'a>(slices: impl IntoIterator<Item = &'a str>) -> String {
+    let slices: Vec<&str> = slices
+        .into_iter()
+        .map(str::trim)
+        .filter(|slice| !slice.is_empty())
+        .collect();
+    if !slices.iter().any(|slice| has_heading(slice)) {
+        return concatenate_summaries(slices);
+    }
+
+    let mut preamble: Vec<&str> = Vec::new();
+    // Heading order of first appearance, with each heading's collected bodies.
+    let mut sections: Vec<(String, String, Vec<&str>)> = Vec::new();
+    for slice in &slices {
+        for (heading, body) in split_sections(slice) {
+            let body = body.trim();
+            if body.is_empty() && heading.is_some() {
+                continue;
+            }
+            let Some(heading) = heading else {
+                preamble.push(body);
+                continue;
+            };
+            let key = heading_key(heading);
+            match sections
+                .iter_mut()
+                .find(|(existing, _, _)| *existing == key)
+            {
+                Some((_, _, bodies)) => bodies.push(body),
+                None => sections.push((key, heading.to_string(), vec![body])),
+            }
+        }
+    }
+
+    let mut out = concatenate_summaries(preamble);
+    for (_, heading, bodies) in sections {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&heading);
+        out.push_str("\n\n");
+        out.push_str(&concatenate_summaries(bodies));
+    }
+    out
+}
+
+fn has_heading(slice: &str) -> bool {
+    slice.lines().any(|line| heading_level(line).is_some())
+}
+
+/// Markdown ATX heading level, ignoring lines inside fenced code blocks is left to callers.
+fn heading_level(line: &str) -> Option<usize> {
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    if (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
+        Some(hashes)
+    } else {
+        None
+    }
+}
+
+/// Splits a slice into `(heading, body)` pairs; the first pair has no heading when the slice
+/// opens with prose. Fenced code blocks are skipped so `#` comments inside them are not headings.
+fn split_sections(slice: &str) -> Vec<(Option<&str>, &str)> {
+    let mut sections: Vec<(Option<&str>, &str)> = Vec::new();
+    let mut heading: Option<&str> = None;
+    let mut body_start = 0usize;
+    let mut offset = 0usize;
+    let mut in_fence = false;
+    for line in slice.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence && heading_level(trimmed).is_some() {
+            sections.push((heading, &slice[body_start..offset]));
+            heading = Some(trimmed);
+            body_start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    sections.push((heading, &slice[body_start..]));
+    sections
+}
+
+/// Case- and punctuation-insensitive key so slices that vary a heading's spelling still merge.
+fn heading_key(heading: &str) -> String {
+    heading
+        .trim_start_matches('#')
+        .trim()
+        .trim_end_matches([':', '.'])
+        .to_lowercase()
 }
 
 /// Joins stage summaries (and the final delta summary) into one handover summary.
